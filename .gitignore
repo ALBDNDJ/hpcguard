@@ -1,0 +1,11 @@
+# System & Config files
+.DS_Store
+*.log
+*.pid
+.hpcguard/
+*.slurm.tmp
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
