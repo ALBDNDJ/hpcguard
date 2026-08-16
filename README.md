@@ -46,6 +46,28 @@ hpcguard
 
 ---
 
+## 🧠 Hard-Learned Lessons & Design Rationale
+
+HPCGuard is not an abstract theory—it is engineered directly from **real-world production incidents and failure modes** encountered while running autonomous agents on multi-user HPC systems:
+
+### 1. Why simple `.bashrc` aliases fail against AI Agents
+* **The Failure**: Traditional advice recommends defining bash wrapper functions like `find() { ... }` or `alias grep=...`. However, autonomous agents frequently execute inline Python one-liners such as `python -c "import os; [print(f) for f in os.walk('/gpfs')]"`. Python directly invokes libc `opendir()`/`stat()` system calls, **completely bypassing shell-level aliases**.
+* **HPCGuard Solution**: Command-level pre-execution interception and regex-based AST parsing (`hpcguard exec`) that inspects the actual payload and language runtime arguments.
+
+### 2. The "D-State / Metadata I/O Stall" Illusion
+* **The Failure**: When an agent recursively searches a shared parallel filesystem (GPFS, Lustre, NFS), processes enter Linux `D` state (uninterruptible disk sleep). While per-process CPU usage appears deceptively low ($10\% \sim 15\%$), the storage metadata server gets locked, causing the entire login node load average to surge from $2.0$ to over $90.0$. Simple CPU threshold monitors completely miss this.
+* **HPCGuard Solution**: Path-boundary enforcement that rejects broad scans starting from root or shared mount points (`/`, `/gpfs`, `/shared`, `/home`) before disk traversal begins.
+
+### 3. Multiprocessing Dilution Attacks
+* **The Failure**: An agent executing a Python script with `multiprocessing.Pool(processes=16)` divides work across 16 sub-processes, each utilizing $25\%$ CPU. Each individual process evades standard single-process $100\%$ CPU alarms, but aggregates to $400\%$ CPU load across shared physical cores.
+* **HPCGuard Solution**: Pre-execution blocking of distributed ML frameworks (`torchrun`, `accelerate`, `mpirun`) combined with user-space aggregate workload tracking.
+
+### 4. Preventing "Exit Code 137" Retry Loops
+* **The Failure**: If a background daemon blindly sends `kill -9` to a rogue agent process without feedback, the agent interprets the sudden SIGKILL (exit code 137) as an intermittent crash and immediately attempts to rerun the exact same command in a retry loop.
+* **HPCGuard Solution**: Clear, structured block messages explaining *why* the command was rejected and providing copy-paste ready `srun` / `sbatch` replacement commands.
+
+---
+
 ## 🚀 Key Features & Demo
 
 ### 1. Command Pre-Check & Redirection (`hpcguard exec`)
