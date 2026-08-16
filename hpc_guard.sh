@@ -78,13 +78,13 @@ cmd_exec_guard() {
     if [[ "$target_cmd" =~ (torchrun|accelerate[[:space:]]+launch|deepspeed|mpirun|horovodrun) ]]; then
         blocked=true
         reason="Distributed ML training framework detected on login node."
-        suggested_cmd="srun --partition=GPU3 --gres=gpu:1 --cpus-per-task=4 python <script.py> (or submit via 'sbatch your_job.slurm')"
+        suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 python <script.py> (or submit via 'sbatch your_job.slurm')"
     
     # 2. Python training or heavy compute scripts
     elif [[ "$target_cmd" =~ python[0-9]*[[:space:]]+.*(train|finetune|pretrain|fit|wcr|embedding) ]]; then
         blocked=true
         reason="Python training / heavy computation script detected outside Slurm allocation."
-        suggested_cmd="srun --partition=GPU3 --gres=gpu:1 --cpus-per-task=4 $target_cmd"
+        suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 $target_cmd"
 
     # 3. Large-scale recursive disk scanning on shared filesystems
     elif [[ "$target_cmd" =~ find[[:space:]]+(\/|\/gpfs|\/shared|\/home)[[:space:]] ]] || [[ "$target_cmd" =~ grep[[:space:]]+-r[a-zA-Z]*[[:space:]]+(\/|\/gpfs|\/shared) ]]; then
@@ -108,7 +108,7 @@ cmd_exec_guard() {
         echo -e "${YELLOW}Reason:${NC}   $reason"
         echo -e "${GREEN}${BOLD}Suggested Execution:${NC}"
         echo -e "  $suggested_cmd\n"
-        echo -e "${BLUE}💡 Hint: To submit jobs properly, run: ${BOLD}hpcguard template${NC}\n"
+        echo -e "${BLUE}💡 Hint: To generate a batch script, run: ${BOLD}hpcguard template${NC}\n"
         return 101
     else
         # Allow safe command to proceed
@@ -124,7 +124,7 @@ start_watchdog() {
         return 0
     fi
 
-    echo -e "${GREEN}Starting HPCGuard Watchdog in background...${NC}"
+    echo -e "${GREEN}Starting HPCGuard Watchdog daemon in background...${NC}"
     nohup bash -c "
     while true; do
         # Catch processes belonging to current user exceeding CPU threshold
@@ -143,7 +143,7 @@ start_watchdog() {
     " >/dev/null 2>&1 &
 
     echo $! > "$PID_FILE"
-    echo -e "${GREEN}✅ Watchdog started successfully (PID: $!).${NC}"
+    echo -e "${GREEN}✅ Watchdog daemon started successfully (PID: $!).${NC}"
 }
 
 stop_watchdog() {
@@ -177,12 +177,12 @@ status_watchdog() {
 
 # --- Module 3: Slurm Batch Template Generator ---
 generate_slurm_template() {
-    echo -e "\n${BOLD}--- Interactive Slurm Template Generator ---${NC}"
+    echo -e "\n${BOLD}--- Interactive Slurm Job Generator ---${NC}"
     read -r -p "Job Name [my_job]: " job_name
     job_name=${job_name:-my_job}
 
-    read -r -p "Partition [GPU3]: " partition
-    partition=${partition:-GPU3}
+    read -r -p "Partition [gpu]: " partition
+    partition=${partition:-gpu}
 
     read -r -p "GPU Count [1]: " gpus
     gpus=${gpus:-1}
@@ -196,7 +196,7 @@ generate_slurm_template() {
     read -r -p "Time limit [12:00:00]: " time_limit
     time_limit=${time_limit:-12:00:00}
 
-    read -r -p "Python Execution Command [python main.py]: " py_cmd
+    read -r -p "Command to run [python main.py]: " py_cmd
     py_cmd=${py_cmd:-python main.py}
 
     local filename="${job_name}.slurm"
@@ -258,16 +258,16 @@ show_menu() {
     echo "                     Version: $VERSION"
     echo "================================================================"
     echo -e "${NC}"
-    echo -e " [1] 查看当前节点状态与保护配置 (Status)"
-    echo -e " [2] 启动后台高负载熔断守护 (Start Watchdog)"
-    echo -e " [3] 停止后台高负载熔断守护 (Stop Watchdog)"
-    echo -e " [4] 切换超载自动 Kill 模式 (Toggle Auto-Kill: ${BOLD}$AUTO_KILL${NC})"
-    echo -e " [5] 交互式生成标准 Slurm 任务脚本 (Generate Slurm Template)"
-    echo -e " [6] 注入全局 'hpcguard' 终端命令别名 (Install Alias)"
-    echo -e " [7] 查看拦截与运行日志 (View Logs)"
-    echo -e " [0] 退出 (Exit)"
+    echo -e " [1] View System & Guard Status"
+    echo -e " [2] Start Background Resource Watchdog"
+    echo -e " [3] Stop Background Resource Watchdog"
+    echo -e " [4] Toggle Auto-Kill Mode (Current: ${BOLD}$AUTO_KILL${NC})"
+    echo -e " [5] Generate Standard Slurm Batch Script"
+    echo -e " [6] Install 'hpcguard' Global Shell Alias"
+    echo -e " [7] View Guard & Watchdog Logs"
+    echo -e " [0] Exit"
     echo ""
-    read -r -p "请选择操作 [0-7]: " choice
+    read -r -p "Select option [0-7]: " choice
     case $choice in
         1) status_watchdog ;;
         2) start_watchdog ;;
