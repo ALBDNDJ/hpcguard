@@ -1,138 +1,89 @@
-# HPCGuard 🛡️
+# HPCGuard
 
-> A zero-root, user-space safety layer for AI coding agents (Claude Code, Codex CLI, Cursor, OpenHands) and researchers on shared HPC clusters.
+> An account-scoped, user-space safety net for researchers using AI agents on shared HPC login nodes.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Slurm Ready](https://img.shields.io/badge/Scheduler-Slurm-orange.svg)](#)
-[![Zero Root Required](https://img.shields.io/badge/Root-Not_Required-green.svg)](#)
+HPCGuard helps prevent *your own* commands and AI-agent workflows from accidentally burdening a shared login node when administrator-enforced guardrails are unavailable. It does not require root access, control other users, bypass scheduler policy, or replace Slurm/cgroups.
 
----
+## Why it exists
 
-## 💡 Why HPCGuard?
+Many clusters depend on training and user discipline rather than enforcing login-node CPU, memory, or I/O limits. That model becomes fragile when coding agents can inspect data, run scripts, retry failures, and chain commands autonomously. The account owner may be responsible for a misplaced training job or broad filesystem scan before they notice it.
 
-Shared HPC cluster login nodes are designed exclusively for lightweight tasks: code editing, light compilation, environment checks, and job submission.
+HPCGuard was shaped by real user-side failure modes:
 
-However, autonomous AI coding agents (such as Claude Code, Codex, and terminal agents) often lack environment awareness:
-- Accidentally running `torchrun` or `python train.py` directly on the login node.
-- Spawning massive recursive disk scans across network storage (`find /gpfs -type f`, `grep -R`).
-- Triggering high-concurrency builds (`make -j64`), crashing shared CPU and memory resources.
+- a `python -c` traversal using `os.walk()` bypassed Bash aliases for `find` and `grep`;
+- GPFS metadata scans stalled in Linux `D` state with low CPU, while login-node load climbed;
+- multiprocessing workers stayed below single-PID CPU thresholds but saturated capacity together;
+- naive watchdog matching of `bash -c '...'` caused false positives in harmless Slurm polling commands.
 
-**This results in cluster login node freezes, account suspensions, and complaints from peers.**
+It therefore provides a preflight helper and a periodic, account-only watchdog. The watchdog examines running processes rather than trusting shell aliases alone.
 
-`HPCGuard` acts as an autonomous safety belt:
-1. **Pre-execution Interception**: Inspects agent shell commands before execution. If a heavy workload is detected on a login node, it blocks execution and outputs a structured Slurm (`srun` / `sbatch`) alternative.
-2. **Background Watchdog & Breaker**: Silently monitors user-space processes on the login node and terminates runaway tasks exceeding CPU thresholds.
-3. **Slurm Assistant**: Interactively generates production-ready Slurm batch scripts in seconds.
+## Scope and guarantees
 
----
+HPCGuard is an opt-in heuristic guardrail. It can reduce common mistakes, but cannot guarantee that every workload or storage incident will be detected. Administrator-managed cgroups, scheduler policy, and documented login-node rules remain the only system-level controls.
 
-## ⚡ Quick Start (1-Line Installation)
+By default it only records warnings. Automatic termination is an explicit per-user configuration choice.
 
-No root permissions or administrator cooperation required. Simply run on your cluster login node:
+## Install
+
+Clone or download a tagged release, then run:
 
 ```bash
-wget -O hpc_guard.sh <RELEASE_URL> && chmod +x hpc_guard.sh && ./hpc_guard.sh
+chmod +x hpc_guard.sh
+./hpc_guard.sh init
+./hpc_guard.sh doctor
+./hpc_guard.sh watch --once --dry-run
 ```
 
-### Enable Global Shortcut
-Run option `[6]` in the menu or execute:
-```bash
-./hpc_guard.sh install-alias
-```
-After reloading your shell (`source ~/.bashrc` or `source ~/.zshrc`), you can invoke HPCGuard anytime with:
-```bash
-hpcguard
-```
-
----
-
-## 🧠 Hard-Learned Lessons & Design Rationale
-
-HPCGuard is not an abstract theory—it is engineered directly from **real-world production incidents and failure modes** encountered while running autonomous agents on multi-user HPC systems:
-
-### 1. Why simple `.bashrc` aliases fail against AI Agents
-* **The Failure**: Traditional advice recommends defining bash wrapper functions like `find() { ... }` or `alias grep=...`. However, autonomous agents frequently execute inline Python one-liners such as `python -c "import os; [print(f) for f in os.walk('/gpfs')]"`. Python directly invokes libc `opendir()`/`stat()` system calls, **completely bypassing shell-level aliases**.
-* **HPCGuard Solution**: Command-level pre-execution interception and regex-based AST parsing (`hpcguard exec`) that inspects the actual payload and language runtime arguments.
-
-### 2. The "D-State / Metadata I/O Stall" Illusion
-* **The Failure**: When an agent recursively searches a shared parallel filesystem (GPFS, Lustre, NFS), processes enter Linux `D` state (uninterruptible disk sleep). While per-process CPU usage appears deceptively low ($10\% \sim 15\%$), the storage metadata server gets locked, causing the entire login node load average to surge from $2.0$ to over $90.0$. Simple CPU threshold monitors completely miss this.
-* **HPCGuard Solution**: Path-boundary enforcement that rejects broad scans starting from root or shared mount points (`/`, `/gpfs`, `/shared`, `/home`) before disk traversal begins.
-
-### 3. Multiprocessing Dilution Attacks
-* **The Failure**: An agent executing a Python script with `multiprocessing.Pool(processes=16)` divides work across 16 sub-processes, each utilizing $25\%$ CPU. Each individual process evades standard single-process $100\%$ CPU alarms, but aggregates to $400\%$ CPU load across shared physical cores.
-* **HPCGuard Solution**: Pre-execution blocking of distributed ML frameworks (`torchrun`, `accelerate`, `mpirun`) combined with user-space aggregate workload tracking.
-
-### 4. Preventing "Exit Code 137" Retry Loops
-* **The Failure**: If a background daemon blindly sends `kill -9` to a rogue agent process without feedback, the agent interprets the sudden SIGKILL (exit code 137) as an intermittent crash and immediately attempts to rerun the exact same command in a retry loop.
-* **HPCGuard Solution**: Clear, structured block messages explaining *why* the command was rejected and providing copy-paste ready `srun` / `sbatch` replacement commands.
-
----
-
-## 🚀 Key Features & Demo
-
-### 1. Command Pre-Check & Redirection (`hpcguard exec`)
-Wrap terminal commands or agent execution commands with `hpcguard exec`:
+Review `~/.config/hpcguard/config`. When its dry-run output matches your policy, set `ACTION=terminate` and install the one-minute cron watcher:
 
 ```bash
-hpcguard exec "torchrun --nproc_per_node=4 train_model.py"
+./hpc_guard.sh install-cron
 ```
 
-**Output:**
-```text
-======================================================
- [HPCGuard: BLOCKED ON LOGIN NODE]
-======================================================
-Host:     login01
-Command:  torchrun --nproc_per_node=4 train_model.py
-Reason:   Distributed ML training framework detected on login node.
-Suggested Execution:
-  srun --partition=GPU3 --gres=gpu:1 --cpus-per-task=4 python <script.py> (or submit via 'sbatch your_job.slurm')
+No background daemon or PID file is used. Cron invokes one short-lived `watch --once` run at a time; a lock prevents overlap.
 
-💡 Hint: To submit jobs properly, run: hpcguard template
-```
+## Commands
 
-### 2. Autonomous Watchdog & Breaker
-- Tracks user processes on the login node.
-- Automatically logs and optionally terminates runaway tasks exceeding thresholds (default: $80\%$ CPU).
-- Start background watchdog with:
-  ```bash
-  hpcguard start
-  ```
+| Command | Purpose |
+| --- | --- |
+| `hpcguard init` | Create an explicit, mode-`600` configuration file. |
+| `hpcguard doctor` | Show host classification, configuration, and cron status. |
+| `hpcguard check -- <command>` | Classify a command without executing it. |
+| `hpcguard watch --once --dry-run` | Evaluate current account processes without signaling them. |
+| `hpcguard watch --once` | Run the configured watchdog action. |
+| `hpcguard install-cron` | Install the one-minute user crontab entry. |
+| `hpcguard uninstall-cron` | Remove HPCGuard’s crontab entry. |
 
-### 3. Slurm Template Generator
-Interactively configure partition, GPU count, CPU cores, memory, and walltime to generate customized `.slurm` batch scripts:
+## Policy model
+
+The watcher is active only when the short hostname matches `LOGIN_HOST_REGEX`; otherwise it exits without inspecting or signaling anything. It processes only `$USER`’s processes and excludes SSH, shells, and Slurm client commands.
+
+It has separate signals for:
+
+- sustained compute CPU, high RSS, and aggregate CPU across compute-like processes;
+- direct recursive `find`, `rg`, and recursive `grep` executions;
+- Python recursive traversal signatures such as `os.walk()` and `Path.rglob()`;
+- broad shared paths, long-running scans, and scan processes in `D` state.
+
+The default policy allows a bounded project scan longer than a broad home/GPFS scan. Thresholds are all visible and configurable in the generated config file. In termination mode, HPCGuard sends `TERM`, waits `GRACE_SECONDS`, then sends `KILL` only if the process survives.
+
+## Design constraints
+
+- It intentionally ignores shell parents such as `bash -c`; direct child executables carry the reliable identity. This prevents text such as `grep -q` inside an unrelated polling loop from being treated as recursive scanning.
+- It logs the PID and PGID for auditability, but terminates the identified PID rather than blindly killing an interactive shell’s process group.
+- It does not scan arbitrary filesystems itself. Its own work is limited to the installing user’s process table and proc working-directory links.
+- It does not automatically reroute a command to Slurm. `check` supplies a decision point; users must choose appropriate `srun`/`sbatch` resources for their cluster.
+
+## Testing
+
+Run the local regression suite:
+
 ```bash
-hpcguard template
+bash tests/test_hpcguard.sh
 ```
 
----
+The regression suite covers real categories: shell-wrapper false positives, recursive search, Python `os.walk`, and scheduler polling. Additional policy paths are kept small and inspectable in the shell script.
 
-## 🤖 AI Agent Integration (Claude Code / Codex / Cursor)
+## License
 
-To ensure your AI coding agent operates safely on shared clusters, add the following instructions to your project's `CLAUDE.md` or `AGENTS.md`:
-
-```markdown
-### HPC Cluster Execution Rules
-- Always prepend long-running, training, or scanning shell commands with `hpcguard exec "<cmd>"`.
-- Never start multi-GPU or distributed ML processes directly on the login node.
-- Use `hpcguard template` or standard Slurm batch scripts for GPU workloads.
-```
-
----
-
-## 🛠️ Usage Cheat Sheet
-
-| Command | Description |
-| :--- | :--- |
-| `hpcguard` | Open interactive TUI management menu |
-| `hpcguard exec "<command>"` | Intercept and guard a specific shell command |
-| `hpcguard start` | Start background resource watchdog daemon |
-| `hpcguard stop` | Stop background resource watchdog daemon |
-| `hpcguard status` | Check node status, watchdog state, and limits |
-| `hpcguard template` | Launch interactive Slurm script generator |
-| `hpcguard install-alias` | Register `hpcguard` command alias into your shell rc |
-
----
-
-## 📄 License
-Released under the [MIT License](LICENSE).
+[MIT](LICENSE)

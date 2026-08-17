@@ -1,317 +1,293 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# HPCGuard v1.0.0
-# Zero-root safety guard for AI coding agents & researchers on shared HPC clusters.
-# ==============================================================================
+# HPCGuard: account-scoped login-node safety guard for shared HPC systems.
+# This is a user-space safety net, not a replacement for scheduler policy.
 
-set -e
+set -Eeuo pipefail
 
-# --- Colors & Styles ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+VERSION="0.2.0"
+PROGRAM_NAME="hpcguard"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hpcguard"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/hpcguard"
+LOG_FILE="$STATE_DIR/watchdog.log"
+LOCK_DIR="${TMPDIR:-/tmp}/hpcguard-${USER}.lock"
 
-VERSION="v1.0.0"
-CONFIG_DIR="$HOME/.hpcguard"
-CONFIG_FILE="$CONFIG_DIR/config.env"
-PID_FILE="$CONFIG_DIR/watchdog.pid"
-LOG_FILE="$CONFIG_DIR/hpcguard.log"
+# Defaults favor visibility over termination. `init` writes these explicitly.
+LOGIN_HOST_REGEX='(^|[-_])(login|head|gateway|mgmt|master)'
+ACTION='warn'                    # warn | terminate
+GRACE_SECONDS=10
+CPU_SOFT_LIMIT=80
+CPU_SOFT_MIN_SECONDS=600
+CPU_HARD_LIMIT=200
+CPU_HARD_MIN_SECONDS=120
+AGGREGATE_CPU_LIMIT=400
+AGGREGATE_MEMBER_CPU_LIMIT=50
+AGGREGATE_MIN_SECONDS=120
+MEM_RSS_LIMIT_KB=67108864        # 64 GiB
+MEM_MIN_SECONDS=60
+MEM_RSS_HARD_LIMIT_KB=134217728  # 128 GiB
+SCAN_MAX_SECONDS=600
+BROAD_SCAN_MAX_SECONDS=120
+D_STATE_SCAN_MIN_SECONDS=30
 
-# --- Default Configurations ---
-CPU_LIMIT=80
-MEM_LIMIT=80
-CHECK_INTERVAL=30
-AUTO_KILL=false
+usage() {
+    cat <<'EOF'
+Usage:
+  hpcguard init
+  hpcguard doctor
+  hpcguard check -- <command...>
+  hpcguard watch --once [--dry-run]
+  hpcguard install-cron
+  hpcguard uninstall-cron
+  hpcguard status
 
-mkdir -p "$CONFIG_DIR"
+`watch --once` is designed for cron or a systemd user timer. It only inspects
+the installing account, and only on configured login nodes.
+EOF
+}
 
-if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-fi
-
-# --- Helper Functions ---
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    echo -e "$msg"
-    echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+    mkdir -p "$STATE_DIR"
+    printf '[%s] %s\n' "$(date '+%F %T %Z')" "$*" >> "$LOG_FILE"
+}
+
+die() { printf '%s\n' "hpcguard: $*" >&2; exit 2; }
+
+require_uint() {
+    [[ "$2" =~ ^[0-9]+$ ]] || die "invalid $1 in $CONFIG_FILE: expected a non-negative integer"
+}
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* ]] || die "invalid config line: $line"
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            LOGIN_HOST_REGEX) LOGIN_HOST_REGEX=$value ;;
+            ACTION)
+                [[ "$value" == warn || "$value" == terminate ]] || die 'ACTION must be warn or terminate'
+                ACTION=$value ;;
+            GRACE_SECONDS|CPU_SOFT_LIMIT|CPU_SOFT_MIN_SECONDS|CPU_HARD_LIMIT|CPU_HARD_MIN_SECONDS|AGGREGATE_CPU_LIMIT|AGGREGATE_MEMBER_CPU_LIMIT|AGGREGATE_MIN_SECONDS|MEM_RSS_LIMIT_KB|MEM_MIN_SECONDS|MEM_RSS_HARD_LIMIT_KB|SCAN_MAX_SECONDS|BROAD_SCAN_MAX_SECONDS|D_STATE_SCAN_MIN_SECONDS)
+                require_uint "$key" "$value"
+                printf -v "$key" '%s' "$value" ;;
+            *) die "unknown config key: $key" ;;
+        esac
+    done < "$CONFIG_FILE"
 }
 
 is_login_node() {
-    # 1. If currently inside a Slurm/PBS batch or interactive allocation, it is a compute node
-    if [ -n "$SLURM_JOB_ID" ] || [ -n "$PBS_JOBID" ]; then
-        return 1
-    fi
-    # 2. Hostname pattern matching for common cluster login/head nodes
     local host
     host=$(hostname -s 2>/dev/null || hostname)
-    if [[ "$host" =~ ^(login|head|master|gateway|mgmt|ln|hpc) ]] || [[ "$host" =~ [0-9]+$ ]]; then
-        return 0
-    fi
-    return 0
+    [[ "$host" =~ $LOGIN_HOST_REGEX ]]
 }
 
-# --- Module 1: Command Pre-execution Guard (exec) ---
-cmd_exec_guard() {
-    local target_cmd="$*"
-    if [ -z "$target_cmd" ]; then
-        echo -e "${RED}Error: No command specified.${NC}"
-        echo "Usage: hpcguard exec \"<command>\""
-        exit 1
-    fi
-
-    # If already running inside a compute node allocation, allow directly
-    if ! is_login_node; then
-        eval "$target_cmd"
-        return $?
-    fi
-
-    # Check dangerous command patterns on login nodes
-    local blocked=false
-    local reason=""
-    local suggested_cmd=""
-
-    # 1. Distributed ML / Multi-GPU training
-    if [[ "$target_cmd" =~ (torchrun|accelerate[[:space:]]+launch|deepspeed|mpirun|horovodrun) ]]; then
-        blocked=true
-        reason="Distributed ML training framework detected on login node."
-        suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 python <script.py> (or submit via 'sbatch your_job.slurm')"
-    
-    # 2. Python training or heavy compute scripts
-    elif [[ "$target_cmd" =~ python[0-9]*[[:space:]]+.*(train|finetune|pretrain|fit|wcr|embedding) ]]; then
-        blocked=true
-        reason="Python training / heavy computation script detected outside Slurm allocation."
-        suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 $target_cmd"
-
-    # 3. Large-scale recursive disk scanning on shared filesystems
-    elif [[ "$target_cmd" =~ find[[:space:]]+(\/|\/gpfs|\/shared|\/home)[[:space:]] ]] || [[ "$target_cmd" =~ grep[[:space:]]+-r[a-zA-Z]*[[:space:]]+(\/|\/gpfs|\/shared) ]]; then
-        blocked=true
-        reason="Recursive scan on shared/root filesystem detected (may cause metadata I/O freeze)."
-        suggested_cmd="Target specific project subdirectories or submit as a lightweight background Slurm batch."
-
-    # 4. High-concurrency builds
-    elif [[ "$target_cmd" =~ make[[:space:]]+-j[0-9]{2,} ]] || [[ "$target_cmd" =~ ninja[[:space:]]+-j[0-9]{2,} ]]; then
-        blocked=true
-        reason="High-concurrency compilation detected (overloaded thread count on shared CPU)."
-        suggested_cmd="Use 'make -j4' or submit compilation to a CPU compute node via srun."
-    fi
-
-    if [ "$blocked" = true ]; then
-        echo -e "\n${RED}${BOLD}======================================================${NC}"
-        echo -e "${RED}${BOLD} [HPCGuard: BLOCKED ON LOGIN NODE]${NC}"
-        echo -e "${RED}${BOLD}======================================================${NC}"
-        echo -e "${YELLOW}Host:${NC}     $(hostname)"
-        echo -e "${YELLOW}Command:${NC}  $target_cmd"
-        echo -e "${YELLOW}Reason:${NC}   $reason"
-        echo -e "${GREEN}${BOLD}Suggested Execution:${NC}"
-        echo -e "  $suggested_cmd\n"
-        echo -e "${BLUE}💡 Hint: To generate a batch script, run: ${BOLD}hpcguard template${NC}\n"
-        return 101
-    else
-        # Allow safe command to proceed
-        eval "$target_cmd"
-        return $?
-    fi
+is_scheduler_exe() {
+    case "$1" in sbatch|squeue|sacct|scancel|srun) return 0 ;; *) return 1 ;; esac
 }
 
-# --- Module 2: Resource Watchdog & Auto-Kill ---
-start_watchdog() {
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "${YELLOW}Watchdog is already running (PID: $(cat "$PID_FILE")).${NC}"
-        return 0
-    fi
-
-    echo -e "${GREEN}Starting HPCGuard Watchdog daemon in background...${NC}"
-    nohup bash -c "
-    while true; do
-        # Catch processes belonging to current user exceeding CPU threshold
-        high_pids=\$(ps -u \$(whoami) -o pid,pcpu,comm --no-headers 2>/dev/null | awk '\$2 >= $CPU_LIMIT {print \$1}')
-        if [ -n \"\$high_pids\" ]; then
-            for pid in \$high_pids; do
-                pname=\$(ps -p \$pid -o comm= 2>/dev/null || echo 'unknown')
-                echo \"[\$(date)] [OVERLOAD DETECTED] Process \$pname (PID \$pid) exceeded $CPU_LIMIT% CPU on login node.\" >> '$LOG_FILE'
-                if [ '$AUTO_KILL' = 'true' ]; then
-                    kill -9 \$pid 2>/dev/null && echo \"[\$(date)] [AUTO-KILL] Terminated runaway process \$pid (\$pname).\" >> '$LOG_FILE'
-                fi
-            done
-        fi
-        sleep $CHECK_INTERVAL
-    done
-    " >/dev/null 2>&1 &
-
-    echo $! > "$PID_FILE"
-    echo -e "${GREEN}✅ Watchdog daemon started successfully (PID: $!).${NC}"
-}
-
-stop_watchdog() {
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        kill "$(cat "$PID_FILE")" 2>/dev/null || true
-        rm -f "$PID_FILE"
-        echo -e "${GREEN}✅ Watchdog stopped.${NC}"
-    else
-        echo -e "${YELLOW}Watchdog is not running.${NC}"
-        rm -f "$PID_FILE"
-    fi
-}
-
-status_watchdog() {
-    echo -e "\n${BOLD}=== HPCGuard System Status ===${NC}"
-    echo -e "Hostname:     ${BLUE}$(hostname)${NC}"
-    if is_login_node; then
-        echo -e "Node Type:    ${YELLOW}Login / Head Node (Guarded)${NC}"
-    else
-        echo -e "Node Type:    ${GREEN}Compute Node / Inside Slurm Allocation${NC}"
-    fi
-
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "Watchdog:     ${GREEN}Running (PID: $(cat "$PID_FILE"))${NC}"
-    else
-        echo -e "Watchdog:     ${RED}Stopped${NC}"
-    fi
-    echo -e "Auto-Kill:    ${BOLD}$AUTO_KILL${NC} (CPU Threshold: ${CPU_LIMIT}%)"
-    echo -e "Log File:     $LOG_FILE\n"
-}
-
-# --- Module 3: Slurm Batch Template Generator ---
-generate_slurm_template() {
-    echo -e "\n${BOLD}--- Interactive Slurm Job Generator ---${NC}"
-    read -r -p "Job Name [my_job]: " job_name
-    job_name=${job_name:-my_job}
-
-    read -r -p "Partition [gpu]: " partition
-    partition=${partition:-gpu}
-
-    read -r -p "GPU Count [1]: " gpus
-    gpus=${gpus:-1}
-
-    read -r -p "CPUs per task [4]: " cpus
-    cpus=${cpus:-4}
-
-    read -r -p "Memory [32G]: " mem
-    mem=${mem:-32G}
-
-    read -r -p "Time limit [12:00:00]: " time_limit
-    time_limit=${time_limit:-12:00:00}
-
-    read -r -p "Command to run [python main.py]: " py_cmd
-    py_cmd=${py_cmd:-python main.py}
-
-    local filename="${job_name}.slurm"
-    cat <<EOF > "$filename"
-#!/bin/bash
-#SBATCH --job-name=${job_name}
-#SBATCH --partition=${partition}
-#SBATCH --gres=gpu:${gpus}
-#SBATCH --cpus-per-task=${cpus}
-#SBATCH --mem=${mem}
-#SBATCH --time=${time_limit}
-#SBATCH --output=${job_name}_%j.log
-
-echo "Job started at: \$(date)"
-echo "Running on node: \$(hostname)"
-nvidia-smi 2>/dev/null || true
-
-# Environment activation (optional)
-# source activate your_env
-
-${py_cmd}
-
-echo "Job finished at: \$(date)"
-EOF
-
-    echo -e "\n${GREEN}✅ Generated Slurm script: ${BOLD}$filename${NC}"
-    echo -e "To submit, run: ${BLUE}sbatch $filename${NC}\n"
-}
-
-# --- Module 4: Global Alias Helper ---
-install_alias() {
-    local script_path
-    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-    local rc_file=""
-    if [ -f "$HOME/.bashrc" ]; then
-        rc_file="$HOME/.bashrc"
-    elif [ -f "$HOME/.zshrc" ]; then
-        rc_file="$HOME/.zshrc"
-    fi
-
-    if [ -n "$rc_file" ]; then
-        if ! grep -q "hpcguard" "$rc_file"; then
-            echo "" >> "$rc_file"
-            echo "# Added by HPCGuard" >> "$rc_file"
-            echo "alias hpcguard=\"bash $script_path\"" >> "$rc_file"
-            echo -e "${GREEN}✅ Added alias 'hpcguard' to $rc_file.${NC}"
-            echo -e "Run ${BLUE}source $rc_file${NC} or restart your shell to use ${BOLD}hpcguard${NC} directly."
-        else
-            echo -e "${YELLOW}Alias already exists in $rc_file.${NC}"
-        fi
-    fi
-}
-
-# --- Interactive Main Menu ---
-show_menu() {
-    echo -e "${BLUE}${BOLD}"
-    echo "================================================================"
-    echo "       HPCGuard: AI Agent & User Safety Layer for HPC"
-    echo "                     Version: $VERSION"
-    echo "================================================================"
-    echo -e "${NC}"
-    echo -e " [1] View System & Guard Status"
-    echo -e " [2] Start Background Resource Watchdog"
-    echo -e " [3] Stop Background Resource Watchdog"
-    echo -e " [4] Toggle Auto-Kill Mode (Current: ${BOLD}$AUTO_KILL${NC})"
-    echo -e " [5] Generate Standard Slurm Batch Script"
-    echo -e " [6] Install 'hpcguard' Global Shell Alias"
-    echo -e " [7] View Guard & Watchdog Logs"
-    echo -e " [0] Exit"
-    echo ""
-    read -r -p "Select option [0-7]: " choice
-    case $choice in
-        1) status_watchdog ;;
-        2) start_watchdog ;;
-        3) stop_watchdog ;;
-        4)
-            if [ "$AUTO_KILL" = "true" ]; then
-                AUTO_KILL=false
-            else
-                AUTO_KILL=true
-            fi
-            echo "AUTO_KILL=$AUTO_KILL" > "$CONFIG_FILE"
-            echo "CPU_LIMIT=$CPU_LIMIT" >> "$CONFIG_FILE"
-            echo -e "${GREEN}Auto-Kill set to: $AUTO_KILL${NC}"
-            ;;
-        5) generate_slurm_template ;;
-        6) install_alias ;;
-        7) [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" || echo "No logs yet." ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}Invalid option.${NC}" ;;
+is_compute_exe() {
+    case "$1" in
+        python|python[0-9]*|pypy|pypy[0-9]*|ipython|jupyter|torchrun|accelerate|deepspeed|pytest|snakemake|nextflow|R|Rscript|matlab|java|perl|node|awk)
+            return 0 ;;
+        *) return 1 ;;
     esac
 }
 
-# --- CLI Parameter Router ---
-case "$1" in
-    exec)
-        shift
-        cmd_exec_guard "$@"
-        ;;
-    start)
-        start_watchdog
-        ;;
-    stop)
-        stop_watchdog
-        ;;
-    status)
-        status_watchdog
-        ;;
-    template)
-        generate_slurm_template
-        ;;
-    install-alias)
-        install_alias
-        ;;
-    *)
-        show_menu
-        ;;
-esac
+is_direct_scan() {
+    local exe=$1 args=$2
+    case "$exe" in find|rg|ripgrep) return 0 ;; esac
+    [ "$exe" = grep ] || return 1
+    [[ "$args" =~ (^|[[:space:]])(--recursive|--directories=recurse)([[:space:]]|$) ]] && return 0
+    [[ "$args" =~ (^|[[:space:]])-[^[:space:]]*[rR][^[:space:]]*([[:space:]]|$) ]]
+}
+
+python_has_recursive_walk() {
+    local args=$1
+    [[ "$args" == *'os.walk('* || "$args" == *'.rglob('* || "$args" == *'.glob("**'* || "$args" == *".glob('**"* || "$args" == *'glob.glob('*'**'* ]]
+}
+
+is_broad_scan() {
+    local args=" $1 " cwd=$2
+    [[ "$args" == *' / '* || "$args" == *' /gpfs '* || "$args" == *' /gpfs/ '* || "$args" == *' /gpfs/hpc '* || "$args" == *' /gpfs/hpc/ '* || "$args" == *" $HOME "* || "$args" == *" $HOME/ "* ]] && return 0
+    # Python -c payloads often quote paths, so token boundaries are not useful.
+    [[ "$1" == *"$HOME"* || "$1" == *'/gpfs/'* ]] && return 0
+    case "$cwd" in
+        /|/gpfs|/gpfs/|/gpfs/hpc|/gpfs/hpc/|"$HOME"|"$HOME"/)
+            [[ "$args" =~ (^|[[:space:]])\.[[:space:]] ]] && return 0 ;;
+    esac
+    return 1
+}
+
+# Emits: ignore, compute, scan-local, scan-broad, python-walk-local, or
+# python-walk-broad. Shell parents are ignored so `bash -c` text cannot create
+# false positives; direct children carry the executable identity.
+classify_command() {
+    local comm=$1 args=$2 cwd=${3:-} exe
+    exe=${comm##*/}
+    is_scheduler_exe "$exe" && { printf 'ignore\n'; return; }
+    case "$exe" in bash|sh|zsh|fish|sshd|login_node_watchdog.sh|hpc_guard.sh) printf 'ignore\n'; return ;; esac
+    if is_direct_scan "$exe" "$args"; then
+        if is_broad_scan "$args" "$cwd"; then printf 'scan-broad\n'; else printf 'scan-local\n'; fi
+        return
+    fi
+    if is_compute_exe "$exe"; then
+        if [[ "$exe" == python* || "$exe" == pypy* || "$exe" == ipython ]] && python_has_recursive_walk "$args"; then
+            if is_broad_scan "$args" "$cwd"; then printf 'python-walk-broad\n'; else printf 'python-walk-local\n'; fi
+            return
+        fi
+        printf 'compute\n'
+        return
+    fi
+    printf 'ignore\n'
+}
+
+emit_check() {
+    local command="$*" exe args kind
+    [ -n "$command" ] || die 'check expects a command after --'
+    exe=${command%%[[:space:]]*}
+    args=${command#"$exe"}
+    kind=$(classify_command "$exe" "$args" "$(pwd -P)")
+    case "$kind" in
+        ignore) printf 'ALLOW: no configured risk signature detected.\n' ;;
+        compute) printf 'WARN: compute-like command. Use a Slurm allocation if this is not a brief check.\n' ;;
+        scan-local|python-walk-local) printf 'WARN: recursive scan in a project path. Keep it bounded; move prolonged scans to Slurm.\n' ;;
+        scan-broad|python-walk-broad) printf 'BLOCK: broad shared-filesystem traversal detected. Submit it to Slurm or narrow the path.\n'; return 20 ;;
+    esac
+}
+
+terminate_pid() {
+    local pid=$1 reason=$2 metadata=$3 dry_run=$4
+    if [ "$dry_run" = true ] || [ "$ACTION" = warn ]; then
+        log "WARN reason=$reason pid=$pid $metadata"
+        printf 'WARN  pid=%s reason=%s %s\n' "$pid" "$reason" "$metadata"
+        return
+    fi
+    log "TERM reason=$reason pid=$pid $metadata"
+    printf 'TERM  pid=%s reason=%s %s\n' "$pid" "$reason" "$metadata"
+    kill -TERM "$pid" 2>/dev/null || return
+    sleep "$GRACE_SECONDS"
+    if kill -0 "$pid" 2>/dev/null; then
+        log "KILL reason=$reason pid=$pid $metadata"
+        printf 'KILL  pid=%s reason=%s %s\n' "$pid" "$reason" "$metadata"
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+}
+
+watch_once() (
+    local dry_run=false
+    [ "${1:-}" = --dry-run ] && dry_run=true
+    [ -z "${1:-}" ] || [ "${1:-}" = --dry-run ] || die 'watch accepts only an optional --dry-run'
+    is_login_node || { printf 'SKIP: not a configured login node.\n'; return 0; }
+
+    mkdir -p "$STATE_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then printf 'SKIP: watcher already running.\n'; return 0; fi
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+    local -a source_cmd
+    if [ -n "${HPCGUARD_SNAPSHOT_FILE:-}" ]; then source_cmd=(cat "$HPCGUARD_SNAPSHOT_FILE"); else source_cmd=(ps ww -u "$USER" -o pid,ppid,pgid,stat,etimes,pcpu,rss,comm,args); fi
+
+    local -a pid_a=() pgid_a=() stat_a=() etime_a=() pcpu_a=() rss_a=() comm_a=() args_a=() kind_a=() cwd_a=()
+    local line pid ppid pgid stat etimes pcpu rss comm args cwd kind cpu_int total_cpu=0 first=true
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$first" = true ] && [[ "$line" == *PID* ]]; then first=false; continue; fi
+        first=false
+        read -r pid ppid pgid stat etimes pcpu rss comm args <<< "$line"
+        [[ "${pid:-}" =~ ^[0-9]+$ ]] || continue
+        [ "$pid" = "$$" ] && continue
+        [[ "$stat" == *Z* ]] && continue
+        cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
+        kind=$(classify_command "$comm" "$args" "$cwd")
+        [ "$kind" = ignore ] && continue
+        cpu_int=${pcpu%.*}; cpu_int=${cpu_int:-0}
+        pid_a+=("$pid"); pgid_a+=("$pgid"); stat_a+=("$stat"); etime_a+=("${etimes:-0}"); pcpu_a+=("${pcpu:-0}"); rss_a+=("${rss:-0}"); comm_a+=("$comm"); args_a+=("$args"); kind_a+=("$kind"); cwd_a+=("$cwd")
+        if [[ "$kind" == compute || "$kind" == python-walk-* ]] && [ "${etimes:-0}" -ge "$AGGREGATE_MIN_SECONDS" ]; then total_cpu=$((total_cpu + cpu_int)); fi
+    done < <("${source_cmd[@]}")
+
+    local i reason metadata
+    for i in "${!pid_a[@]}"; do
+        reason=''
+        if [ "${rss_a[$i]}" -ge "$MEM_RSS_HARD_LIMIT_KB" ]; then reason="rss_hard";
+        elif [[ "${kind_a[$i]}" == scan-* || "${kind_a[$i]}" == python-walk-* ]] && [[ "${stat_a[$i]}" == *D* ]] && [ "${etime_a[$i]}" -ge "$D_STATE_SCAN_MIN_SECONDS" ]; then reason="scan_d_state";
+        elif [[ "${kind_a[$i]}" == *broad* ]] && [ "${etime_a[$i]}" -ge "$BROAD_SCAN_MAX_SECONDS" ]; then reason="broad_scan_timeout";
+        elif [[ "${kind_a[$i]}" == scan-local || "${kind_a[$i]}" == python-walk-local ]] && [ "${etime_a[$i]}" -ge "$SCAN_MAX_SECONDS" ]; then reason="scan_timeout";
+        elif [ "${pcpu_a[$i]%.*}" -ge "$CPU_HARD_LIMIT" ] && [ "${etime_a[$i]}" -ge "$CPU_HARD_MIN_SECONDS" ]; then reason="cpu_hard";
+        elif [ "${pcpu_a[$i]%.*}" -ge "$CPU_SOFT_LIMIT" ] && [ "${etime_a[$i]}" -ge "$CPU_SOFT_MIN_SECONDS" ]; then reason="cpu_soft";
+        elif [ "${rss_a[$i]}" -ge "$MEM_RSS_LIMIT_KB" ] && [ "${etime_a[$i]}" -ge "$MEM_MIN_SECONDS" ]; then reason="rss_timeout";
+        elif [[ "${kind_a[$i]}" == compute || "${kind_a[$i]}" == python-walk-* ]] && [ "$total_cpu" -ge "$AGGREGATE_CPU_LIMIT" ] && [ "${pcpu_a[$i]%.*}" -ge "$AGGREGATE_MEMBER_CPU_LIMIT" ] && [ "${etime_a[$i]}" -ge "$AGGREGATE_MIN_SECONDS" ]; then reason="aggregate_cpu";
+        fi
+        [ -n "$reason" ] || continue
+        metadata="pgid=${pgid_a[$i]} kind=${kind_a[$i]} cpu=${pcpu_a[$i]}% rss_kb=${rss_a[$i]} age=${etime_a[$i]}s cwd=${cwd_a[$i]} comm=${comm_a[$i]} args=${args_a[$i]}"
+        terminate_pid "${pid_a[$i]}" "$reason" "$metadata" "$dry_run"
+    done
+)
+
+write_default_config() {
+    mkdir -p "$CONFIG_DIR"
+    [ ! -e "$CONFIG_FILE" ] || die "$CONFIG_FILE already exists; edit it directly"
+    cat > "$CONFIG_FILE" <<'EOF'
+# Only machines matching this pattern are monitored.
+LOGIN_HOST_REGEX=(^|[-_])(login|head|gateway|mgmt|master)
+# Start safely. Change to `terminate` only after checking dry-run output.
+ACTION=warn
+CPU_SOFT_LIMIT=80
+CPU_SOFT_MIN_SECONDS=600
+CPU_HARD_LIMIT=200
+CPU_HARD_MIN_SECONDS=120
+AGGREGATE_CPU_LIMIT=400
+AGGREGATE_MEMBER_CPU_LIMIT=50
+AGGREGATE_MIN_SECONDS=120
+MEM_RSS_LIMIT_KB=67108864
+MEM_MIN_SECONDS=60
+MEM_RSS_HARD_LIMIT_KB=134217728
+SCAN_MAX_SECONDS=600
+BROAD_SCAN_MAX_SECONDS=120
+D_STATE_SCAN_MIN_SECONDS=30
+GRACE_SECONDS=10
+EOF
+    chmod 600 "$CONFIG_FILE"
+    printf 'Created %s\n' "$CONFIG_FILE"
+}
+
+install_cron() {
+    local self cron_line existing
+    self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
+    cron_line="* * * * * $self watch --once >/dev/null 2>&1 # hpcguard"
+    existing=$(crontab -l 2>/dev/null || true)
+    [[ "$existing" == *'# hpcguard'* ]] && die 'an HPCGuard cron entry already exists'
+    { printf '%s\n' "$existing"; printf '%s\n' "$cron_line"; } | crontab -
+    printf 'Installed one-minute cron watcher. Run `%s watch --once --dry-run` before setting ACTION=terminate.\n' "$PROGRAM_NAME"
+}
+
+uninstall_cron() {
+    local existing
+    existing=$(crontab -l 2>/dev/null || true)
+    printf '%s\n' "$existing" | awk '!/# hpcguard$/' | crontab -
+    printf 'Removed HPCGuard cron entries.\n'
+}
+
+doctor() {
+    local host
+    host=$(hostname -s 2>/dev/null || hostname)
+    printf 'HPCGuard %s\nHost: %s\nConfig: %s\nAction: %s\n' "$VERSION" "$host" "$CONFIG_FILE" "$ACTION"
+    if is_login_node; then printf 'Node classification: login node (active)\n'; else printf 'Node classification: not configured as a login node (inactive)\n'; fi
+    if crontab -l 2>/dev/null | grep -Fq '# hpcguard'; then printf 'Cron watcher: installed\n'; else printf 'Cron watcher: not installed\n'; fi
+}
+
+main() {
+    load_config
+    case "${1:-}" in
+        init) [ "$#" -eq 1 ] || die 'init accepts no arguments'; write_default_config ;;
+        doctor|status) [ "$#" -eq 1 ] || die "$1 accepts no arguments"; doctor ;;
+        check) shift; [ "${1:-}" = -- ] && shift; emit_check "$@" ;;
+        watch) shift; [ "${1:-}" = --once ] || die 'use: hpcguard watch --once [--dry-run]'; shift; watch_once "${1:-}" ;;
+        install-cron) [ "$#" -eq 1 ] || die 'install-cron accepts no arguments'; install_cron ;;
+        uninstall-cron) [ "$#" -eq 1 ] || die 'uninstall-cron accepts no arguments'; uninstall_cron ;;
+        -h|--help|help|'') usage ;;
+        *) die "unknown command: $1" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

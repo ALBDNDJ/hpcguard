@@ -1,0 +1,4 @@
+  PID  PPID  PGID STAT ELAPSED %CPU   RSS COMMAND         COMMAND
+900001     1 900001 D         45  1.0  1500 find            find /gpfs/shared/dataset -type f
+900002     1 900002 S        700  0.0  1600 bash            bash -c while squeue -h -j 42 | grep -q 42; do sleep 45; done
+900003     1 900003 R        200 230.0 20480 python          python train.py

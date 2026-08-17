@@ -3,18 +3,17 @@
 When executing terminal commands in this repository or on this HPC cluster, autonomous agents (Claude Code, Codex, OpenHands, Cursor) MUST adhere to the following safety policies:
 
 ## 1. Login Node Awareness
-- You are currently running in a shared user-space shell on an HPC login/head node.
-- Compute-intensive jobs, multi-GPU scripts, model training, and heavy disk traversals are STRICTLY PROHIBITED on login nodes.
+- Treat a shared login/head node as a lightweight control plane, not a compute environment.
+- Compute-intensive jobs, multi-GPU scripts, model training, and broad disk traversals are prohibited there.
+- Do not assume the hostname alone is sufficient: check the configured cluster policy and scheduler allocation state before running a command.
 
-## 2. Command Interception
-- For any command that may run for more than 30 seconds, perform distributed computing, or train deep learning models, wrap the execution with `hpcguard exec`:
+## 2. Command Preflight
+- For a potentially heavy command, use the non-executing preflight helper first:
   ```bash
-  hpcguard exec "<command>"
+  hpcguard check -- <command>
   ```
-- If HPCGuard blocks the command with `[HPCGuard: BLOCKED ON LOGIN NODE]`, do NOT attempt to bypass or retry directly. Instead:
-  1. Parse the suggested Slurm command (`srun` / `sbatch`).
-  2. Write a standard `.slurm` batch submission script.
-  3. Submit using `sbatch <job_script>.slurm`.
+- A warning or block is a decision point, not an invitation to re-run the same work directly. Submit a suitable `srun`/`sbatch` job instead.
+- Do not rely on preflight alone. The periodic `hpcguard watch --once` watchdog is the second-line, account-scoped safeguard.
 
 ## 3. Allowed Direct Operations
 The following lightweight operations are safe to run directly on the login node:

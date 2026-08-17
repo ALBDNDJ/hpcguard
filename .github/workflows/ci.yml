@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n hpc_guard.sh tests/test_hpcguard.sh
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+      - name: Regression tests
+        run: bash tests/test_hpcguard.sh
