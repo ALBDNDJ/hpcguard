@@ -23,6 +23,18 @@ HPCGuard is an opt-in heuristic guardrail. It can reduce common mistakes, but ca
 
 By default it only records warnings. Automatic termination is an explicit per-user configuration choice.
 
+## Supported environment
+
+HPCGuard currently targets user-managed Linux login nodes with `/proc`, a
+`ps` implementation that exposes PID/PPID/PGID/resource fields, and either
+cron or a systemd user timer. It is designed around Slurm/PBS-style workflows,
+but does not require a specific scheduler installation.
+
+It is **not** an administrator-level security boundary. It cannot replace
+cgroups, scheduler limits, storage quotas, or a cluster's acceptable-use
+policy. Always use the cluster's documented `srun`/`sbatch` workflow for work
+that is not clearly lightweight.
+
 ## Install
 
 Clone or download a tagged release, then run:
@@ -41,6 +53,24 @@ Review `~/.config/hpcguard/config`. When its dry-run output matches your policy,
 ```
 
 No background daemon or PID file is used. Cron invokes one short-lived `watch --once` run at a time; a lock prevents overlap.
+
+## Demo
+
+Preflight never executes the supplied command. It identifies a broad recursive
+scan and directs the user to narrow it or submit it through the scheduler:
+
+```bash
+$ ./hpc_guard.sh check -- find /gpfs/shared -type f
+BLOCK: broad shared-filesystem traversal detected. Submit it to Slurm or narrow the path.
+```
+
+The watchdog is a second line of defense. Start with dry-run mode, inspect its
+output and log, and only then opt into `ACTION=terminate`:
+
+```bash
+$ ./hpc_guard.sh watch --once --dry-run
+WARN  pid=… reason=scan_d_state pgid=… kind=scan-broad …
+```
 
 ## Commands
 
@@ -73,6 +103,22 @@ The default policy allows a bounded project scan longer than a broad home/GPFS s
 - It logs the PID and PGID for auditability, but terminates the identified PID rather than blindly killing an interactive shell’s process group.
 - It does not scan arbitrary filesystems itself. Its own work is limited to the installing user’s process table and proc working-directory links.
 - It does not automatically reroute a command to Slurm. `check` supplies a decision point; users must choose appropriate `srun`/`sbatch` resources for their cluster.
+
+## Field validation and feedback
+
+The policy model was developed from anonymized operation of an account-scoped
+watchdog on a shared Slurm cluster. It includes failure modes that ordinary
+shell aliases missed: Python recursive traversal, low-CPU storage stalls,
+aggregate compute load, and false positives in shell-based job polling.
+
+This repository deliberately publishes no real cluster identity, user name,
+data path, job identifier, or command log. Early adopters should begin in
+`warn` or dry-run mode and report only anonymized observations. Useful reports
+include the scheduler family, login-host naming convention, whether the rule
+detected the intended process, false positives, and platform-specific notes.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) before
+opening an issue.
 
 ## Testing
 
