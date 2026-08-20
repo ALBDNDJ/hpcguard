@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HPCGuard v1.2.0
+# HPCGuard v1.3.0
 # Zero-root safety guard for AI coding agents & researchers on shared HPC clusters.
-# Supporting Python ML, R/Bioinformatics, VSCode Remote & C/C++ Governance.
+# Supporting Python ML, R/Bioinformatics, Genomics Pipelines, and Job Diagnostics.
 # ==============================================================================
 
 set -e
@@ -15,7 +15,7 @@ BLUE='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-VERSION="v1.2.0"
+VERSION="v1.3.0"
 CONFIG_DIR="$HOME/.hpcguard"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 PID_FILE="$CONFIG_DIR/watchdog.pid"
@@ -88,19 +88,25 @@ cmd_exec_guard() {
         reason="Python training / heavy computation script detected outside Slurm allocation."
         suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 $target_cmd"
 
-    # 3. R Language & Bioinformatics pipelines (Seurat, DESeq2, Rscript analysis, R package compilation)
+    # 3. R Language & Statistical pipelines (Seurat, DESeq2, Rscript analysis, R package compilation)
     elif [[ "$target_cmd" =~ (Rscript|R[[:space:]]+CMD|install\.packages|devtools::|BiocManager::|Seurat|DESeq2|RunPCA|RunUMAP) ]]; then
         blocked=true
         reason="Heavy R/Bioinformatics pipeline or native package compilation detected on login node."
         suggested_cmd="srun --partition=cpu --cpus-per-task=8 --mem=32G $target_cmd (or submit via 'sbatch r_job.slurm')"
 
-    # 4. Large-scale recursive disk scanning on shared network filesystems (GPFS, Lustre, NFS)
+    # 4. Genomics & Alignment heavy CLI tools (bwa, samtools sort/index, gatk, minimap2, bowtie2, deepvariant, snakemake, nextflow)
+    elif [[ "$target_cmd" =~ (bwa[[:space:]]+(mem|aln)|samtools[[:space:]]+(sort|index)|gatk[[:space:]]+|minimap2|bowtie2|deepvariant|snakemake[[:space:]]+-j|nextflow[[:space:]]+run) ]]; then
+        blocked=true
+        reason="Heavy genomics alignment / variant calling pipeline detected on login node."
+        suggested_cmd="srun --partition=cpu --cpus-per-task=8 --mem=32G $target_cmd (or submit via 'sbatch genomics_job.slurm')"
+
+    # 5. Large-scale recursive disk scanning on shared network filesystems (GPFS, Lustre, NFS)
     elif [[ "$target_cmd" =~ find[[:space:]]+(\/|\/gpfs|\/shared|\/home)[[:space:]] ]] || [[ "$target_cmd" =~ grep[[:space:]]+-r[a-zA-Z]*[[:space:]]+(\/|\/gpfs|\/shared) ]]; then
         blocked=true
         reason="Recursive scan on shared/root filesystem detected (may trigger D-state metadata I/O stall)."
         suggested_cmd="Target specific project subdirectories or submit as a lightweight background Slurm batch."
 
-    # 5. High-concurrency builds (make / ninja)
+    # 6. High-concurrency builds (make / ninja)
     elif [[ "$target_cmd" =~ make[[:space:]]+-j[0-9]{2,} ]] || [[ "$target_cmd" =~ ninja[[:space:]]+-j[0-9]{2,} ]]; then
         blocked=true
         reason="High-concurrency compilation detected (overloaded thread count on shared CPU)."
@@ -159,7 +165,7 @@ start_watchdog() {
             echo \"[\$(date)] [STORAGE I/O D-STATE DETECTED] Process(es) \$d_pids waiting on parallel filesystem metadata locks.\" >> '$LOG_FILE'
         fi
 
-        # 4. IDE / Language Server Background Indexing Check (e.g. Node Pylance)
+        # 4. IDE / Language Server Background Indexing Check (e.g. Node Pylance / Rsession)
         lsp_pids=\$(ps -u \$(whoami) -o pid,pcpu,comm --no-headers 2>/dev/null | grep -E 'node|pylance|rsession' | awk '\$2 >= 60 {print \$1}')
         if [ -n \"\$lsp_pids\" ]; then
             echo \"[\$(date)] [IDE LANGUAGE SERVER OVERLOAD] Detected high CPU indexing on login node (PIDs: \$lsp_pids). Run 'hpcguard init-vscode' to optimize.\" >> '$LOG_FILE'
@@ -204,17 +210,34 @@ status_watchdog() {
     echo -e "Log File:         $LOG_FILE\n"
 }
 
-# --- Module 3: Multi-Language Slurm Batch Generator ---
+# --- Module 3: Multi-Language Slurm Batch Generator (with Array Rate Limiter) ---
 generate_slurm_template() {
     echo -e "\n${BOLD}--- Interactive Slurm Job Generator ---${NC}"
     echo -e "Select workload type:"
     echo -e " [1] Python / Deep Learning (GPU/CUDA)"
     echo -e " [2] R / Bioinformatics / High-Memory Statistics (CPU)"
-    read -r -p "Select [1-2, default: 1]: " work_type
+    echo -e " [3] Genomics Alignment / Variant Calling (CPU)"
+    read -r -p "Select [1-3, default: 1]: " work_type
     work_type=${work_type:-1}
 
     read -r -p "Job Name [my_job]: " job_name
     job_name=${job_name:-my_job}
+
+    read -r -p "Enable Slurm Array Job? [y/N]: " is_array
+    is_array=${is_array:-N}
+
+    local array_directive=""
+    if [[ "$is_array" =~ ^[Yy]$ ]]; then
+        read -r -p "Array Range [1-50]: " array_range
+        array_range=${array_range:-1-50}
+
+        read -r -p "Max Concurrent Subtasks [%10]: " array_concurrency
+        array_concurrency=${array_concurrency:-10}
+        array_concurrency=${array_concurrency#%} # Strip % if user typed it
+
+        array_directive="#SBATCH --array=${array_range}%${array_concurrency}"
+        echo -e "${BLUE}💡 Array rate-limiting enabled: max ${array_concurrency} tasks running simultaneously.${NC}"
+    fi
 
     local filename="${job_name}.slurm"
 
@@ -238,6 +261,7 @@ generate_slurm_template() {
 #!/bin/bash
 #SBATCH --job-name=${job_name}
 #SBATCH --partition=${partition}
+${array_directive}
 #SBATCH --cpus-per-task=${cpus}
 #SBATCH --mem=${mem}
 #SBATCH --time=${time_limit}
@@ -253,6 +277,42 @@ echo "Running on node: \$(hostname)"
 ${r_cmd}
 
 echo "Job finished at: \$(date)"
+EOF
+    elif [ "$work_type" = "3" ]; then
+        read -r -p "Partition [cpu]: " partition
+        partition=${partition:-cpu}
+
+        read -r -p "CPUs per task [16]: " cpus
+        cpus=${cpus:-16}
+
+        read -r -p "Memory [64G]: " mem
+        mem=${mem:-64G}
+
+        read -r -p "Time limit [12:00:00]: " time_limit
+        time_limit=${time_limit:-12:00:00}
+
+        read -r -p "Command to run [bwa mem -t 16 ref.fa read1.fq read2.fq]: " gen_cmd
+        gen_cmd=${gen_cmd:-bwa mem -t 16 ref.fa read1.fq read2.fq}
+
+        cat <<EOF > "$filename"
+#!/bin/bash
+#SBATCH --job-name=${job_name}
+#SBATCH --partition=${partition}
+${array_directive}
+#SBATCH --cpus-per-task=${cpus}
+#SBATCH --mem=${mem}
+#SBATCH --time=${time_limit}
+#SBATCH --output=${job_name}_%j.log
+
+echo "Genomics pipeline started at: \$(date)"
+echo "Running on node: \$(hostname)"
+
+# Load modules
+# module load bwa/0.7.17 samtools/1.18 2>/dev/null || true
+
+${gen_cmd}
+
+echo "Genomics pipeline finished at: \$(date)"
 EOF
     else
         read -r -p "Partition [gpu]: " partition
@@ -277,6 +337,7 @@ EOF
 #!/bin/bash
 #SBATCH --job-name=${job_name}
 #SBATCH --partition=${partition}
+${array_directive}
 #SBATCH --gres=gpu:${gpus}
 #SBATCH --cpus-per-task=${cpus}
 #SBATCH --mem=${mem}
@@ -300,7 +361,41 @@ EOF
     echo -e "To submit, run: ${BLUE}sbatch $filename${NC}\n"
 }
 
-# --- Module 4: VSCode Remote Anti-Stall Config Generator ---
+# --- Module 4: Job Diagnostics & Failure Inspector (inspect) ---
+inspect_job() {
+    local job_id="$1"
+    if [ -z "$job_id" ]; then
+        echo -e "${RED}Error: No Job ID specified.${NC}"
+        echo "Usage: hpcguard inspect <job_id>"
+        return 1
+    fi
+
+    echo -e "\n${BLUE}${BOLD}======================================================${NC}"
+    echo -e "${BLUE}${BOLD} [HPCGuard: Slurm Job Diagnostics (Job ID: $job_id)]${NC}"
+    echo -e "${BLUE}${BOLD}======================================================${NC}"
+
+    if command -v sacct >/dev/null 2>&1; then
+        echo -e "${YELLOW}Accounting Summary (sacct):${NC}"
+        sacct -j "$job_id" --format=JobID,JobName%20,Partition,State,ExitCode,MaxRSS,Elapsed,NodeList
+        echo ""
+    else
+        echo -e "${YELLOW}Notice: 'sacct' command not found on current host.${NC}\n"
+    fi
+
+    # Attempt to locate log files in current directory
+    local candidate_logs
+    candidate_logs=$(find . -maxdepth 2 -name "*${job_id}*.log" 2>/dev/null || true)
+    if [ -n "$candidate_logs" ]; then
+        for log_path in $candidate_logs; do
+            echo -e "${GREEN}Found Job Log: ${BOLD}$log_path${NC}"
+            echo -e "${YELLOW}--- Tail (Last 15 lines) ---${NC}"
+            tail -n 15 "$log_path"
+            echo -e "${YELLOW}----------------------------${NC}\n"
+        done
+    fi
+}
+
+# --- Module 5: VSCode Remote Anti-Stall Config Generator ---
 init_vscode_settings() {
     local target_dir="${1:-.}"
     local vscode_dir="$target_dir/.vscode"
@@ -342,7 +437,7 @@ EOF
     echo -e "This disables recursive symlinks, excludes massive datasets from file watchers, and limits Pylance indexing.\n"
 }
 
-# --- Module 5: Global Alias Helper ---
+# --- Module 6: Global Alias Helper ---
 install_alias() {
     local script_path
     script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -378,13 +473,14 @@ show_menu() {
     echo -e " [2] Start Background Resource Watchdog"
     echo -e " [3] Stop Background Resource Watchdog"
     echo -e " [4] Toggle Auto-Kill Mode (Current: ${BOLD}$AUTO_KILL${NC})"
-    echo -e " [5] Generate Slurm Batch Script (Python / R)"
-    echo -e " [6] Initialize Safe VSCode Remote Settings (.vscode/settings.json)"
-    echo -e " [7] Install 'hpcguard' Global Shell Alias"
-    echo -e " [8] View Guard & Watchdog Logs"
+    echo -e " [5] Generate Slurm Batch Script (Python / R / Genomics / Array)"
+    echo -e " [6] Inspect Slurm Job Diagnostics (hpcguard inspect <id>)"
+    echo -e " [7] Initialize Safe VSCode Remote Settings (.vscode/settings.json)"
+    echo -e " [8] Install 'hpcguard' Global Shell Alias"
+    echo -e " [9] View Guard & Watchdog Logs"
     echo -e " [0] Exit"
     echo ""
-    read -r -p "Select option [0-8]: " choice
+    read -r -p "Select option [0-9]: " choice
     case $choice in
         1) status_watchdog ;;
         2) start_watchdog ;;
@@ -401,9 +497,13 @@ show_menu() {
             echo -e "${GREEN}Auto-Kill set to: $AUTO_KILL${NC}"
             ;;
         5) generate_slurm_template ;;
-        6) init_vscode_settings ;;
-        7) install_alias ;;
-        8) [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" || echo "No logs yet." ;;
+        6)
+            read -r -p "Enter Slurm Job ID to inspect: " input_jid
+            inspect_job "$input_jid"
+            ;;
+        7) init_vscode_settings ;;
+        8) install_alias ;;
+        9) [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" || echo "No logs yet." ;;
         0) exit 0 ;;
         *) echo -e "${RED}Invalid option.${NC}" ;;
     esac
@@ -414,6 +514,10 @@ case "$1" in
     exec)
         shift
         cmd_exec_guard "$@"
+        ;;
+    inspect)
+        shift
+        inspect_job "$@"
         ;;
     start)
         start_watchdog
