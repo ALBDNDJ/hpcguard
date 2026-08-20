@@ -1,7 +1,7 @@
 # HPCGuard 🛡️
 
 > A zero-root, user-space safety governance layer for AI coding agents (Claude Code, Codex CLI, Cursor, OpenHands) and researchers on shared HPC clusters.
-> Supporting Python ML/DL, R/Bioinformatics, and C/C++ Workload Orchestration.
+> Supporting Python ML/DL, R/Bioinformatics, VSCode Remote & C/C++ Workload Orchestration.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Slurm Ready](https://img.shields.io/badge/Scheduler-Slurm-orange.svg)](#)
@@ -18,7 +18,8 @@ However, autonomous AI coding agents and automated research workflows frequently
 - Running multi-GPU training (`torchrun`, `accelerate`) or heavy Python scripts directly on login nodes.
 - Spawning in-memory R / Bioinformatics pipelines (`Rscript`, `Seurat`, `DESeq2`) that implicitly saturate 32+ CPU cores and tens of gigabytes of RAM.
 - Launching native R/C++ package compilation (`install.packages`, `make -j64`).
-- Executing recursive scans across parallel network filesystems (`find /gpfs -type f`, `grep -R`), locking metadata servers.
+- Unregulated VSCode Remote & Language Server indexing (`node`, `pylance`, `rsession`) traversing millions of files across network filesystems, crashing GPFS/Lustre metadata servers.
+- Executing recursive scans across parallel storage (`find /gpfs -type f`, `grep -R`).
 
 **This results in cluster login node freezes, account suspensions, and complaints from peers.**
 
@@ -26,6 +27,7 @@ However, autonomous AI coding agents and automated research workflows frequently
 1. **Pre-execution Interception (`hpcguard exec`)**: Inspects shell commands before execution. Blocks dangerous workloads on login nodes and rewrites them into compliant `srun` / `sbatch` commands.
 2. **Multi-Vector Watchdog & Breaker**: Silently monitors single-process CPU, aggregate multi-process dilution, and storage D-state I/O locks.
 3. **Slurm Job Assistant**: Interactively generates production-ready Slurm batch scripts for both **Python ML** and **R / Bioinformatics**.
+4. **IDE Workspace Anti-Stall Helper (`hpcguard init-vscode`)**: Automatically configures safe `.vscode/settings.json` to eliminate recursive file watchers and background language server metadata storms.
 
 ---
 
@@ -38,7 +40,7 @@ wget -O hpc_guard.sh https://raw.githubusercontent.com/playfulsoul/hpcguard/main
 ```
 
 ### Enable Global Shortcut
-Run option `[6]` in the menu or execute:
+Run option `[7]` in the menu or execute:
 ```bash
 ./hpc_guard.sh install-alias
 ```
@@ -61,15 +63,19 @@ HPCGuard is engineered directly from **real-world production incidents and failu
 * **The Failure**: When an agent or script recursively searches a shared parallel filesystem (GPFS, Lustre, NFS), processes enter Linux `D` state (uninterruptible disk sleep). While per-process CPU usage appears deceptively low ($10\% \sim 15\%$), the storage metadata server gets locked, causing the entire login node load average to surge from $2.0$ to over $90.0$. Simple CPU threshold monitors completely miss this.
 * **HPCGuard Solution**: Path-boundary enforcement that rejects broad scans starting from root or shared mount points (`/`, `/gpfs`, `/shared`, `/home`) before disk traversal begins.
 
-### 3. The R Language & In-Memory Bioinformatics Trap
+### 3. The VSCode Remote & IDE Language Server Metadata Avalanche
+* **The Failure**: VSCode Remote and Language Servers (Pylance, R Language Server) automatically scan every workspace subdirectory to construct autocomplete symbol tables. When datasets containing $100,000+$ files (e.g., `.mat`, `.pt`, `.h5`) exist in the project, the background Node.js process initiates millions of `stat()` syscalls, crashing GPFS metadata and causing CPU overload ($130\%+$).
+* **HPCGuard Solution**: One-click generation of safe workspace settings (`hpcguard init-vscode`) that disables symlink loops, excludes raw datasets from file watchers, and caps indexing depths.
+
+### 4. The R Language & In-Memory Bioinformatics Trap
 * **The Failure**: R workloads (such as single-cell RNA-seq clustering via `Seurat` or package installation via `install.packages()`) default to in-memory loading and implicit multi-threading (BLAS/OpenMP), stealthily spawning 32+ threads and consuming dozens of gigabytes of RAM on login nodes.
 * **HPCGuard Solution**: Explicit interception of `Rscript`, `R CMD INSTALL`, and common bioinformatics frameworks, auto-redirecting them to high-memory CPU compute nodes.
 
-### 4. Multiprocessing Dilution Attacks
+### 5. Multiprocessing Dilution Attacks
 * **The Failure**: An agent executing a Python script with `multiprocessing.Pool(processes=16)` divides work across 16 sub-processes, each utilizing $25\%$ CPU. Each individual process evades standard single-process $100\%$ CPU alarms, but aggregates to $400\%$ CPU load across shared physical cores.
 * **HPCGuard Solution**: Pre-execution blocking of distributed frameworks (`torchrun`, `accelerate`, `mpirun`) combined with real-time tracking of total user aggregate CPU load.
 
-### 5. Preventing "Exit Code 137" Retry Loops
+### 6. Preventing "Exit Code 137" Retry Loops
 * **The Failure**: If a background daemon blindly sends `kill -9` to a rogue agent process without feedback, the agent interprets the sudden SIGKILL (exit code 137) as an intermittent crash and immediately attempts to rerun the exact same command in a retry loop.
 * **HPCGuard Solution**: Clear, structured block messages explaining *why* the command was rejected and providing copy-paste ready `srun` / `sbatch` replacement commands.
 
@@ -101,7 +107,13 @@ Suggested Execution:
 💡 Hint: To generate a batch script, run: hpcguard template
 ```
 
-### 2. Multi-Vector Watchdog & Breaker
+### 2. VSCode Remote Anti-Stall Setup (`hpcguard init-vscode`)
+Instantly inject optimized `.vscode/settings.json` into your current directory to stop background file watchers from scanning large datasets:
+```bash
+hpcguard init-vscode
+```
+
+### 3. Multi-Vector Watchdog & Breaker
 - **Single Process Threshold**: Terminates rogue processes exceeding threshold (default: $80\%$ CPU).
 - **Aggregate CPU Threshold**: Detects multi-process pool dilution attacks (default: $200\%$ total CPU).
 - **D-State Storage Monitor**: Flags processes waiting on parallel filesystem metadata locks.
@@ -110,7 +122,7 @@ Suggested Execution:
   hpcguard start
   ```
 
-### 3. Slurm Template Generator (Python & R)
+### 4. Slurm Template Generator (Python & R)
 Interactively generate customized `.slurm` batch scripts for **Python ML (GPU)** or **R / Bioinformatics (High-Memory CPU)**:
 ```bash
 hpcguard template
@@ -126,6 +138,7 @@ Add the following instructions to your project's `CLAUDE.md` or `AGENTS.md`:
 ### HPC Cluster Execution Rules
 - Always prepend long-running, training, Rscript, or scanning commands with `hpcguard exec "<cmd>"`.
 - Never start multi-GPU, PyTorch training, or heavy R/Bioinformatics processes directly on login nodes.
+- When opening large dataset workspaces, run `hpcguard init-vscode` to prevent language server indexing storms.
 - Use `hpcguard template` or standard Slurm batch scripts for GPU and CPU compute workloads.
 ```
 
@@ -137,6 +150,7 @@ Add the following instructions to your project's `CLAUDE.md` or `AGENTS.md`:
 | :--- | :--- |
 | `hpcguard` | Open interactive TUI management menu |
 | `hpcguard exec "<command>"` | Intercept and guard a specific shell command |
+| `hpcguard init-vscode` | Generate anti-stall `.vscode/settings.json` for current project |
 | `hpcguard start` | Start background multi-vector watchdog daemon |
 | `hpcguard stop` | Stop background watchdog daemon |
 | `hpcguard status` | Check node status, watchdog state, and CPU limits |

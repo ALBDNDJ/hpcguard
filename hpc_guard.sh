@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HPCGuard v1.1.0
+# HPCGuard v1.2.0
 # Zero-root safety guard for AI coding agents & researchers on shared HPC clusters.
-# Supporting Python ML, R/Bioinformatics, and C/C++ Workload Governance.
+# Supporting Python ML, R/Bioinformatics, VSCode Remote & C/C++ Governance.
 # ==============================================================================
 
 set -e
@@ -15,7 +15,7 @@ BLUE='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-VERSION="v1.1.0"
+VERSION="v1.2.0"
 CONFIG_DIR="$HOME/.hpcguard"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 PID_FILE="$CONFIG_DIR/watchdog.pid"
@@ -159,6 +159,12 @@ start_watchdog() {
             echo \"[\$(date)] [STORAGE I/O D-STATE DETECTED] Process(es) \$d_pids waiting on parallel filesystem metadata locks.\" >> '$LOG_FILE'
         fi
 
+        # 4. IDE / Language Server Background Indexing Check (e.g. Node Pylance)
+        lsp_pids=\$(ps -u \$(whoami) -o pid,pcpu,comm --no-headers 2>/dev/null | grep -E 'node|pylance|rsession' | awk '\$2 >= 60 {print \$1}')
+        if [ -n \"\$lsp_pids\" ]; then
+            echo \"[\$(date)] [IDE LANGUAGE SERVER OVERLOAD] Detected high CPU indexing on login node (PIDs: \$lsp_pids). Run 'hpcguard init-vscode' to optimize.\" >> '$LOG_FILE'
+        fi
+
         sleep $CHECK_INTERVAL
     done
     " >/dev/null 2>&1 &
@@ -294,7 +300,49 @@ EOF
     echo -e "To submit, run: ${BLUE}sbatch $filename${NC}\n"
 }
 
-# --- Module 4: Global Alias Helper ---
+# --- Module 4: VSCode Remote Anti-Stall Config Generator ---
+init_vscode_settings() {
+    local target_dir="${1:-.}"
+    local vscode_dir="$target_dir/.vscode"
+    local settings_file="$vscode_dir/settings.json"
+
+    mkdir -p "$vscode_dir"
+
+    cat <<EOF > "$settings_file"
+{
+    "search.followSymlinks": false,
+    "remote.autoForwardPorts": false,
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/node_modules/**": true,
+        "**/.venv/**": true,
+        "**/miniconda3/**": true,
+        "**/data/**": true,
+        "**/dataset/**": true,
+        "**/checkpoints/**": true,
+        "**/*.mat": true,
+        "**/*.pt": true,
+        "**/*.pth": true,
+        "**/*.csv": true,
+        "**/*.h5": true,
+        "**/*.tar*": true
+    },
+    "python.analysis.indexing": false,
+    "python.analysis.userFileIndexingLimit": 2000,
+    "python.analysis.packageIndexDepths": [
+        { "name": "", "depth": 1, "includeAllSymbols": false }
+    ],
+    "git.autorefresh": false,
+    "git.autoRepositoryDetection": "openEditors"
+}
+EOF
+
+    echo -e "\n${GREEN}✅ Generated safe VSCode Remote settings: ${BOLD}$settings_file${NC}"
+    echo -e "This disables recursive symlinks, excludes massive datasets from file watchers, and limits Pylance indexing.\n"
+}
+
+# --- Module 5: Global Alias Helper ---
 install_alias() {
     local script_path
     script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -331,11 +379,12 @@ show_menu() {
     echo -e " [3] Stop Background Resource Watchdog"
     echo -e " [4] Toggle Auto-Kill Mode (Current: ${BOLD}$AUTO_KILL${NC})"
     echo -e " [5] Generate Slurm Batch Script (Python / R)"
-    echo -e " [6] Install 'hpcguard' Global Shell Alias"
-    echo -e " [7] View Guard & Watchdog Logs"
+    echo -e " [6] Initialize Safe VSCode Remote Settings (.vscode/settings.json)"
+    echo -e " [7] Install 'hpcguard' Global Shell Alias"
+    echo -e " [8] View Guard & Watchdog Logs"
     echo -e " [0] Exit"
     echo ""
-    read -r -p "Select option [0-7]: " choice
+    read -r -p "Select option [0-8]: " choice
     case $choice in
         1) status_watchdog ;;
         2) start_watchdog ;;
@@ -352,8 +401,9 @@ show_menu() {
             echo -e "${GREEN}Auto-Kill set to: $AUTO_KILL${NC}"
             ;;
         5) generate_slurm_template ;;
-        6) install_alias ;;
-        7) [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" || echo "No logs yet." ;;
+        6) init_vscode_settings ;;
+        7) install_alias ;;
+        8) [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" || echo "No logs yet." ;;
         0) exit 0 ;;
         *) echo -e "${RED}Invalid option.${NC}" ;;
     esac
@@ -376,6 +426,10 @@ case "$1" in
         ;;
     template)
         generate_slurm_template
+        ;;
+    init-vscode)
+        shift
+        init_vscode_settings "$@"
         ;;
     install-alias)
         install_alias
