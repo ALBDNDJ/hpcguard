@@ -28,3 +28,7 @@ The following lightweight operations are safe to run directly on the login node:
 - `squeue -u $USER`, `sinfo`, `scancel`
 - Light file edits, `cat`, `head`, `tail`, `grep` within specific local project directories
 - Light verification scripts, e.g. `python -c "import torch; print(torch.__version__)"` or `R --version`
+
+## 6. SSH Liveness Checks
+- Never create a short-interval loop around `nc -z`, `/dev/tcp`, or a fresh `ssh` connection. Repeated pre-authentication resets may trigger institutional IDS alerts.
+- To check connectivity, reuse a manually established OpenSSH ControlMaster with `hpcguard probe <ssh-config-host>`. If no live control socket exists, stop and leave authentication to the user.

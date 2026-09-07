@@ -1,7 +1,7 @@
 # HPCGuard 🛡️
 
 > A zero-root, user-space safety governance layer for AI coding agents (Claude Code, Codex CLI, Cursor, OpenHands) and researchers on shared HPC clusters.
-> Supporting Python ML/DL, R/Bioinformatics, Genomics Pipelines, VSCode Remote & Slurm Array Orchestration.
+> Supporting Python ML/DL, R/Bioinformatics, Genomics Pipelines, VSCode Remote, Slurm Arrays, and safe SSH liveness checks.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Slurm Ready](https://img.shields.io/badge/Scheduler-Slurm-orange.svg)](#)
@@ -24,11 +24,12 @@ However, autonomous AI coding agents and automated scientific workflows frequent
 **This results in cluster login node freezes, account suspensions, and complaints from peers.**
 
 `HPCGuard` acts as an autonomous safety runtime:
-1. **Pre-execution Interception (`hpcguard exec`)**: Inspects shell commands before execution. Blocks dangerous workloads on login nodes and rewrites them into compliant `srun` / `sbatch` commands.
+1. **Pre-execution Interception (`hpcguard exec`)**: Inspects shell commands before execution. Blocks matched workloads on login nodes and suggests a compliant `srun` / `sbatch` alternative.
 2. **Job Failure Inspector & Diagnostics (`hpcguard inspect <id>`)**: Automatically inspects Slurm accounting states, exit codes, and tails job logs to identify reasons for failure (OOM, timeouts, syntax errors).
 3. **Multi-Vector Watchdog & Breaker**: Silently monitors single-process CPU, aggregate multi-process dilution, and storage D-state I/O locks.
 4. **Slurm Job Assistant (with Array Rate Limiting)**: Interactively generates production-ready Slurm batch scripts for **Python ML**, **R / Bioinformatics**, and **Genomics Pipelines** with automatic `%` concurrency rate-limiting.
 5. **IDE Workspace Anti-Stall Helper (`hpcguard init-vscode`)**: Automatically configures safe `.vscode/settings.json` to eliminate recursive file watchers and background language server metadata storms.
+6. **ControlMaster-only SSH Probe (`hpcguard probe`)**: Checks an already-running multiplexed SSH connection through its local Unix socket, with no TCP or authentication fallback.
 
 ---
 
@@ -37,11 +38,11 @@ However, autonomous AI coding agents and automated scientific workflows frequent
 No root permissions or administrator cooperation required. Simply run on your cluster login node:
 
 ```bash
-wget -O hpc_guard.sh https://raw.githubusercontent.com/playfulsoul/hpcguard/main/hpc_guard.sh && chmod +x hpc_guard.sh && ./hpc_guard.sh
+wget -O hpc_guard.sh https://raw.githubusercontent.com/ALBDNDJ/hpcguard/main/hpc_guard.sh && chmod +x hpc_guard.sh && ./hpc_guard.sh
 ```
 
 ### Enable Global Shortcut
-Run option `[8]` in the menu or execute:
+Run option `[9]` in the menu or execute:
 ```bash
 ./hpc_guard.sh install-alias
 ```
@@ -83,6 +84,13 @@ HPCGuard is engineered directly from **real-world production incidents and failu
 ### 7. Preventing "Exit Code 137" Retry Loops
 * **The Failure**: If a background daemon blindly sends `kill -9` to a rogue agent process without feedback, the agent interprets the sudden SIGKILL (exit code 137) as an intermittent crash and immediately attempts to rerun the exact same command in a retry loop.
 * **HPCGuard Solution**: Clear, structured block messages explaining *why* the command was rejected and providing copy-paste ready `srun` / `sbatch` replacement commands.
+
+### 8. The SSH Liveness Probe and IDS Alert Trap
+
+* **The Failure**: A lab-side automation repeatedly opened and immediately closed a TCP connection to an SSH service on a short interval. The server accumulated a large volume of `Connection reset ... [preauth]` records, and network monitoring classified the pattern as possible probing or brute-force activity.
+* **HPCGuard Solution**: `hpcguard exec` rejects tight loops built around `nc -z`, `/dev/tcp`, or fresh `ssh` connections. `hpcguard probe <host>` checks only an existing OpenSSH ControlMaster Unix socket and fails closed when that socket is absent—without opening a new TCP connection.
+
+`[preauth]` means that authentication had not completed; by itself it does not prove whether a username or authentication method had already been offered. Incident attribution should use the full server and network evidence, not this suffix alone.
 
 ---
 
@@ -133,6 +141,24 @@ Instantly inject optimized `.vscode/settings.json` into your current directory t
 hpcguard init-vscode
 ```
 
+### 5. Safe SSH Liveness Check (`hpcguard probe`)
+
+Configure OpenSSH multiplexing for your host, establish the connection manually, then check the existing local control socket:
+
+```sshconfig
+Host cluster
+    HostName cluster.example.edu
+    ControlMaster auto
+    ControlPath ~/.ssh/control-%C
+    ControlPersist 10m
+```
+
+```bash
+hpcguard probe cluster
+```
+
+This command never creates a new SSH session. If the ControlMaster socket is missing or stale, it reports that state and stops. It does not fall back to TCP probing or authentication.
+
 ---
 
 ## 🤖 AI Agent Integration (Claude Code / Codex / Cursor)
@@ -146,6 +172,7 @@ Add the following instructions to your project's `CLAUDE.md` or `AGENTS.md`:
 - When opening large dataset workspaces, run `hpcguard init-vscode` to prevent language server indexing storms.
 - When submitting array jobs, always include concurrency limits (e.g., `--array=1-100%10`).
 - If a Slurm job fails, diagnose the cause using `hpcguard inspect <job_id>`.
+- Never use a short-interval `nc -z`, `/dev/tcp`, or fresh-SSH loop for liveness monitoring; use `hpcguard probe <host>` only with an existing ControlMaster.
 ```
 
 ---
@@ -157,6 +184,7 @@ Add the following instructions to your project's `CLAUDE.md` or `AGENTS.md`:
 | `hpcguard` | Open interactive TUI management menu |
 | `hpcguard exec "<command>"` | Intercept and guard a specific shell command |
 | `hpcguard inspect <job_id>` | Inspect Slurm job accounting, exit code, and log tail |
+| `hpcguard probe <ssh-host>` | Check an existing ControlMaster socket without a network fallback |
 | `hpcguard init-vscode` | Generate anti-stall `.vscode/settings.json` for current project |
 | `hpcguard start` | Start background multi-vector watchdog daemon |
 | `hpcguard stop` | Stop background watchdog daemon |

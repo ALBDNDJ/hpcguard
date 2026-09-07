@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HPCGuard v1.3.0
+# HPCGuard v1.4.0
 # Zero-root safety guard for AI coding agents & researchers on shared HPC clusters.
-# Supporting Python ML, R/Bioinformatics, Genomics Pipelines, and Job Diagnostics.
+# Supporting compute, storage, IDE, scheduler, and safe SSH liveness workflows.
 # ==============================================================================
 
 set -e
@@ -15,7 +15,7 @@ BLUE='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-VERSION="v1.3.0"
+VERSION="v1.4.0"
 CONFIG_DIR="$HOME/.hpcguard"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 PID_FILE="$CONFIG_DIR/watchdog.pid"
@@ -27,6 +27,8 @@ CPU_AGGREGATE_LIMIT=200    # Total user aggregate CPU %
 MEM_LIMIT=80
 CHECK_INTERVAL=30
 AUTO_KILL=false
+PROBE_MIN_INTERVAL=60
+LOGIN_HOST_REGEX='(^|[-_])(login|head|gateway|mgmt|master|ln)([-_.0-9]|$)'
 
 mkdir -p "$CONFIG_DIR"
 
@@ -44,16 +46,50 @@ log() {
 
 is_login_node() {
     # 1. If currently inside a Slurm/PBS batch or interactive allocation, it is a compute node
-    if [ -n "$SLURM_JOB_ID" ] || [ -n "$PBS_JOBID" ]; then
+    if [ -n "${SLURM_JOB_ID:-}" ] || [ -n "${PBS_JOBID:-}" ]; then
         return 1
     fi
-    # 2. Hostname pattern matching for common cluster login/head nodes
+    # 2. Match only explicit login/head naming patterns. Unknown hosts are not
+    # silently classified as login nodes; sites can override LOGIN_HOST_REGEX.
     local host
-    host=$(hostname -s 2>/dev/null || hostname)
-    if [[ "$host" =~ ^(login|head|master|gateway|mgmt|ln|hpc) ]] || [[ "$host" =~ [0-9]+$ ]]; then
-        return 0
+    host=${HPCGUARD_HOSTNAME_OVERRIDE:-$(hostname -s 2>/dev/null || hostname)}
+    [[ "$host" =~ $LOGIN_HOST_REGEX ]]
+}
+
+# Detect tight TCP/SSH liveness loops before they can create large volumes of
+# unauthenticated connection-reset logs. A single probe is not classified as
+# high frequency; the risky behavior is automated repetition below the floor.
+is_high_frequency_ssh_probe() {
+    local target_cmd="$1"
+    local has_probe=false
+    local has_loop=false
+    local interval=""
+
+    if [[ "$target_cmd" =~ (^|[[:space:];|/])(nc|ncat)([[:space:]]|$) ]] && \
+       [[ "$target_cmd" =~ (^|[[:space:]])-[^[:space:]]*z[^[:space:]]*([[:space:]]|$) ]]; then
+        has_probe=true
+    elif [[ "$target_cmd" == *"/dev/tcp/"* ]]; then
+        has_probe=true
+    elif [[ "$target_cmd" =~ (^|[[:space:];|/])ssh([[:space:]]|$) ]] && \
+         [[ ! "$target_cmd" =~ ssh[[:space:]].*-O[[:space:]]+check([[:space:]]|$) ]]; then
+        has_probe=true
     fi
-    return 0
+
+    if [[ "$target_cmd" =~ (^|[[:space:];])(while|until)([[:space:]]|$) ]] || \
+       [[ "$target_cmd" =~ (^|[[:space:];])watch([[:space:]]|$) ]]; then
+        has_loop=true
+    fi
+
+    [ "$has_probe" = true ] && [ "$has_loop" = true ] || return 1
+
+    if [[ "$target_cmd" =~ sleep[[:space:]]+([0-9]+)(s)?([[:space:];]|$) ]]; then
+        interval=${BASH_REMATCH[1]}
+    elif [[ "$target_cmd" =~ watch[[:space:]]+(-n|--interval)[=[:space:]]+([0-9]+) ]]; then
+        interval=${BASH_REMATCH[2]}
+    fi
+
+    # A repeating probe with no visible delay is treated as a tight loop.
+    [ -z "$interval" ] || [ "$interval" -lt "$PROBE_MIN_INTERVAL" ]
 }
 
 # --- Module 1: Command Pre-execution Guard (exec) ---
@@ -76,37 +112,43 @@ cmd_exec_guard() {
     local reason=""
     local suggested_cmd=""
 
-    # 1. Distributed ML / Multi-GPU training (PyTorch, DeepSpeed, Horovod)
-    if [[ "$target_cmd" =~ (torchrun|accelerate[[:space:]]+launch|deepspeed|mpirun|horovodrun) ]]; then
+    # 1. High-frequency TCP/SSH liveness loops
+    if is_high_frequency_ssh_probe "$target_cmd"; then
+        blocked=true
+        reason="High-frequency TCP/SSH liveness probing can create repeated pre-authentication reset logs and trigger IDS alerts."
+        suggested_cmd="Reuse an existing SSH ControlMaster with 'hpcguard probe <ssh-host>', or use a scheduler/event-driven check."
+
+    # 2. Distributed ML / Multi-GPU training (PyTorch, DeepSpeed, Horovod)
+    elif [[ "$target_cmd" =~ (torchrun|accelerate[[:space:]]+launch|deepspeed|mpirun|horovodrun) ]]; then
         blocked=true
         reason="Distributed ML training framework detected on login node."
         suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 python <script.py> (or submit via 'sbatch your_job.slurm')"
 
-    # 2. Python ML / Deep Learning scripts
+    # 3. Python ML / Deep Learning scripts
     elif [[ "$target_cmd" =~ python[0-9]*[[:space:]]+.*(train|finetune|pretrain|fit|wcr|embedding) ]]; then
         blocked=true
         reason="Python training / heavy computation script detected outside Slurm allocation."
         suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 $target_cmd"
 
-    # 3. R Language & Statistical pipelines (Seurat, DESeq2, Rscript analysis, R package compilation)
+    # 4. R Language & Statistical pipelines (Seurat, DESeq2, Rscript analysis, R package compilation)
     elif [[ "$target_cmd" =~ (Rscript|R[[:space:]]+CMD|install\.packages|devtools::|BiocManager::|Seurat|DESeq2|RunPCA|RunUMAP) ]]; then
         blocked=true
         reason="Heavy R/Bioinformatics pipeline or native package compilation detected on login node."
         suggested_cmd="srun --partition=cpu --cpus-per-task=8 --mem=32G $target_cmd (or submit via 'sbatch r_job.slurm')"
 
-    # 4. Genomics & Alignment heavy CLI tools (bwa, samtools sort/index, gatk, minimap2, bowtie2, deepvariant, snakemake, nextflow)
+    # 5. Genomics & Alignment heavy CLI tools (bwa, samtools sort/index, gatk, minimap2, bowtie2, deepvariant, snakemake, nextflow)
     elif [[ "$target_cmd" =~ (bwa[[:space:]]+(mem|aln)|samtools[[:space:]]+(sort|index)|gatk[[:space:]]+|minimap2|bowtie2|deepvariant|snakemake[[:space:]]+-j|nextflow[[:space:]]+run) ]]; then
         blocked=true
         reason="Heavy genomics alignment / variant calling pipeline detected on login node."
         suggested_cmd="srun --partition=cpu --cpus-per-task=8 --mem=32G $target_cmd (or submit via 'sbatch genomics_job.slurm')"
 
-    # 5. Large-scale recursive disk scanning on shared network filesystems (GPFS, Lustre, NFS)
+    # 6. Large-scale recursive disk scanning on shared network filesystems (GPFS, Lustre, NFS)
     elif [[ "$target_cmd" =~ find[[:space:]]+(\/|\/gpfs|\/shared|\/home)[[:space:]] ]] || [[ "$target_cmd" =~ grep[[:space:]]+-r[a-zA-Z]*[[:space:]]+(\/|\/gpfs|\/shared) ]]; then
         blocked=true
         reason="Recursive scan on shared/root filesystem detected (may trigger D-state metadata I/O stall)."
         suggested_cmd="Target specific project subdirectories or submit as a lightweight background Slurm batch."
 
-    # 6. High-concurrency builds (make / ninja)
+    # 7. High-concurrency builds (make / ninja)
     elif [[ "$target_cmd" =~ make[[:space:]]+-j[0-9]{2,} ]] || [[ "$target_cmd" =~ ninja[[:space:]]+-j[0-9]{2,} ]]; then
         blocked=true
         reason="High-concurrency compilation detected (overloaded thread count on shared CPU)."
@@ -131,8 +173,52 @@ cmd_exec_guard() {
     fi
 }
 
+# Check only an already-running OpenSSH multiplexing master. This function has
+# no network fallback: if the configured Unix control socket is absent, it
+# returns immediately without opening a TCP connection or starting auth.
+probe_existing_master() {
+    local host="${1:-}"
+    local ssh_bin="${HPCGUARD_SSH_BIN:-ssh}"
+    local control_path=""
+
+    if [ -z "$host" ] || [[ "$host" == -* ]]; then
+        echo "Usage: hpcguard probe <ssh-config-host>"
+        return 2
+    fi
+    if ! command -v "$ssh_bin" >/dev/null 2>&1; then
+        echo -e "${RED}Error: OpenSSH client not found.${NC}"
+        return 127
+    fi
+
+    control_path=$(
+        "$ssh_bin" -G -- "$host" 2>/dev/null |
+        awk 'tolower($1) == "controlpath" {sub(/^[^[:space:]]+[[:space:]]+/, ""); print; exit}'
+    )
+
+    if [ -z "$control_path" ] || [ "$control_path" = none ] || [[ "$control_path" == *%* ]]; then
+        echo -e "${YELLOW}No resolved ControlPath is configured for '$host'. No network connection was attempted.${NC}"
+        return 3
+    fi
+    if [ ! -S "$control_path" ]; then
+        echo -e "${YELLOW}No live ControlMaster socket exists for '$host'. No network connection was attempted.${NC}"
+        return 3
+    fi
+
+    if "$ssh_bin" -S "$control_path" -O check -o ConnectionAttempts=1 -- "$host"; then
+        echo -e "${GREEN}ControlMaster is alive. The existing local socket was reused.${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}The ControlMaster socket is stale or unavailable. No new SSH connection was attempted.${NC}"
+    return 4
+}
+
 # --- Module 2: Resource Watchdog, Dilution Guard & Auto-Kill ---
 start_watchdog() {
+    if ! is_login_node; then
+        echo -e "${YELLOW}Watchdog not started: this host is not configured as a login node.${NC}"
+        return 1
+    fi
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${YELLOW}Watchdog daemon is already running (PID: $(cat "$PID_FILE")).${NC}"
         return 0
@@ -473,14 +559,15 @@ show_menu() {
     echo -e " [2] Start Background Resource Watchdog"
     echo -e " [3] Stop Background Resource Watchdog"
     echo -e " [4] Toggle Auto-Kill Mode (Current: ${BOLD}$AUTO_KILL${NC})"
-    echo -e " [5] Generate Slurm Batch Script (Python / R / Genomics / Array)"
-    echo -e " [6] Inspect Slurm Job Diagnostics (hpcguard inspect <id>)"
-    echo -e " [7] Initialize Safe VSCode Remote Settings (.vscode/settings.json)"
-    echo -e " [8] Install 'hpcguard' Global Shell Alias"
-    echo -e " [9] View Guard & Watchdog Logs"
+    echo -e " [5] Check Existing SSH ControlMaster (no TCP fallback)"
+    echo -e " [6] Generate Slurm Batch Script (Python / R / Genomics / Array)"
+    echo -e " [7] Inspect Slurm Job Diagnostics (hpcguard inspect <id>)"
+    echo -e " [8] Initialize Safe VSCode Remote Settings (.vscode/settings.json)"
+    echo -e " [9] Install 'hpcguard' Global Shell Alias"
+    echo -e " [10] View Guard & Watchdog Logs"
     echo -e " [0] Exit"
     echo ""
-    read -r -p "Select option [0-9]: " choice
+    read -r -p "Select option [0-10]: " choice
     case $choice in
         1) status_watchdog ;;
         2) start_watchdog ;;
@@ -496,21 +583,26 @@ show_menu() {
             echo "CPU_AGGREGATE_LIMIT=$CPU_AGGREGATE_LIMIT" >> "$CONFIG_FILE"
             echo -e "${GREEN}Auto-Kill set to: $AUTO_KILL${NC}"
             ;;
-        5) generate_slurm_template ;;
-        6)
+        5)
+            read -r -p "Enter SSH config host alias: " probe_host
+            probe_existing_master "$probe_host"
+            ;;
+        6) generate_slurm_template ;;
+        7)
             read -r -p "Enter Slurm Job ID to inspect: " input_jid
             inspect_job "$input_jid"
             ;;
-        7) init_vscode_settings ;;
-        8) install_alias ;;
-        9) [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" || echo "No logs yet." ;;
+        8) init_vscode_settings ;;
+        9) install_alias ;;
+        10) [ -f "$LOG_FILE" ] && tail -n 25 "$LOG_FILE" || echo "No logs yet." ;;
         0) exit 0 ;;
         *) echo -e "${RED}Invalid option.${NC}" ;;
     esac
 }
 
 # --- CLI Parameter Router ---
-case "$1" in
+main() {
+case "${1:-}" in
     exec)
         shift
         cmd_exec_guard "$@"
@@ -518,6 +610,10 @@ case "$1" in
     inspect)
         shift
         inspect_job "$@"
+        ;;
+    probe)
+        shift
+        probe_existing_master "$@"
         ;;
     start)
         start_watchdog
@@ -542,3 +638,8 @@ case "$1" in
         show_menu
         ;;
 esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

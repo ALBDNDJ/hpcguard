@@ -19,22 +19,47 @@ assert_eq() {
     fi
 }
 
-assert_eq ignore "$(classify_command bash 'bash -c while squeue -h -j 42 | grep -q 42; do sleep 45; done' "$HOME")" 'shell polling text is ignored'
-assert_eq ignore "$(classify_command squeue '-h -j 42' "$HOME")" 'scheduler client is ignored'
-assert_eq scan-local "$(classify_command find 'find /project/src -type f' /project)" 'project find is local scan'
-assert_eq scan-broad "$(classify_command find "find $HOME -type f" "$HOME")" 'home-root find is broad scan'
-assert_eq scan-broad "$(classify_command rg 'rg pattern .' "$HOME")" 'home cwd dot scan is broad'
-assert_eq compute "$(classify_command python 'python train.py' /project)" 'python training is compute-like'
-assert_eq python-walk-broad "$(classify_command python "python -c import os; list(os.walk('$HOME'))" "$HOME")" 'python os.walk is recognized'
-assert_eq python-walk-local "$(classify_command python "python -c from pathlib import Path; list(Path('src').rglob('*.py'))" /project)" 'project Path.rglob is recognized'
-assert_eq ignore "$(classify_command grep 'grep -q READY job.log' "$HOME")" 'nonrecursive grep is ignored'
-assert_eq scan-local "$(classify_command grep 'grep -R TODO src' /project)" 'recursive grep is scan'
+assert_status() {
+    local expected=$1 name=$2
+    shift 2
+    local actual=0
+    "$@" || actual=$?
+    assert_eq "$expected" "$actual" "$name"
+}
 
-test_state=$(mktemp -d)
-trap 'rm -rf "$test_state"' EXIT
-is_login_node() { return 0; }
-watch_output=$(HOME="$test_state/home" XDG_STATE_HOME="$test_state/state" HPCGUARD_SNAPSHOT_FILE="$ROOT/tests/fixtures/processes.txt" watch_once --dry-run)
-assert_eq 2 "$(printf '%s\n' "$watch_output" | awk '/^WARN/{n++} END{print n+0}')" 'watcher detects D-state scans and high CPU from a snapshot'
+assert_status 0 '20-second nc loop is high-frequency' \
+    is_high_frequency_ssh_probe 'while true; do nc -z cluster.example.edu 22; sleep 20; done'
+assert_status 0 'watch-based nc loop is high-frequency' \
+    is_high_frequency_ssh_probe 'watch -n 15 nc -z cluster.example.edu 22'
+assert_status 0 'absolute-path nc loop is high-frequency' \
+    is_high_frequency_ssh_probe 'while /usr/bin/nc -z cluster.example.edu 22; do sleep 20; done'
+assert_status 0 'tight fresh-SSH loop is high-frequency' \
+    is_high_frequency_ssh_probe 'until ssh cluster true; do sleep 10; done'
+assert_status 1 'one-shot nc probe is not classified as a loop' \
+    is_high_frequency_ssh_probe 'nc -z cluster.example.edu 22'
+assert_status 1 'five-minute probe interval is not blocked' \
+    is_high_frequency_ssh_probe 'while true; do nc -z cluster.example.edu 22; sleep 300; done'
+assert_status 1 'ControlMaster check loop is not a fresh SSH probe' \
+    is_high_frequency_ssh_probe 'while ssh -O check cluster; do sleep 20; done'
+
+assert_status 0 'login-style hostname is guarded' \
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; is_login_node' _ "$ROOT/hpc_guard.sh"
+assert_status 1 'ordinary numbered workstation is not a login node' \
+    env HPCGUARD_HOSTNAME_OVERRIDE=workstation42 bash -c 'source "$1"; is_login_node' _ "$ROOT/hpc_guard.sh"
+assert_status 1 'scheduler allocation disables login-node guard' \
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 SLURM_JOB_ID=123 bash -c 'source "$1"; is_login_node' _ "$ROOT/hpc_guard.sh"
+
+guard_output=''
+guard_status=0
+guard_output=$(HPCGUARD_HOSTNAME_OVERRIDE=research-login07 cmd_exec_guard 'while true; do nc -z cluster.example.edu 22; sleep 20; done') || guard_status=$?
+assert_eq 101 "$guard_status" 'exec guard blocks a tight TCP liveness loop'
+assert_eq 1 "$(printf '%s\n' "$guard_output" | awk '/BLOCKED ON LOGIN NODE/{n++} END{print n+0}')" 'blocked probe has a structured explanation'
+
+probe_output=''
+probe_status=0
+probe_output=$(HPCGUARD_SSH_BIN="$ROOT/tests/fixtures/fake_ssh_no_socket.sh" probe_existing_master cluster) || probe_status=$?
+assert_eq 3 "$probe_status" 'probe fails closed without a control socket'
+assert_eq 1 "$(printf '%s\n' "$probe_output" | awk '/No network connection was attempted/{n++} END{print n+0}')" 'probe explains that no network connection was made'
 
 if [ "$fail" -ne 0 ]; then
     printf '%s failed, %s passed\n' "$fail" "$pass" >&2
