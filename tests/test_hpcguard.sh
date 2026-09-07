@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-# shellcheck source=../hpc_guard.sh
+# shellcheck disable=SC1091
 source "$ROOT/hpc_guard.sh"
 
 pass=0
@@ -27,6 +27,14 @@ assert_status() {
     assert_eq "$expected" "$actual" "$name"
 }
 
+is_login_host() {
+    HPCGUARD_HOSTNAME_OVERRIDE=$1 is_login_node
+}
+
+is_login_host_in_allocation() {
+    HPCGUARD_HOSTNAME_OVERRIDE=$1 SLURM_JOB_ID=123 is_login_node
+}
+
 assert_status 0 '20-second nc loop is high-frequency' \
     is_high_frequency_ssh_probe 'while true; do nc -z cluster.example.edu 22; sleep 20; done'
 assert_status 0 'watch-based nc loop is high-frequency' \
@@ -43,11 +51,11 @@ assert_status 1 'ControlMaster check loop is not a fresh SSH probe' \
     is_high_frequency_ssh_probe 'while ssh -O check cluster; do sleep 20; done'
 
 assert_status 0 'login-style hostname is guarded' \
-    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; is_login_node' _ "$ROOT/hpc_guard.sh"
+    is_login_host research-login07
 assert_status 1 'ordinary numbered workstation is not a login node' \
-    env HPCGUARD_HOSTNAME_OVERRIDE=workstation42 bash -c 'source "$1"; is_login_node' _ "$ROOT/hpc_guard.sh"
+    is_login_host workstation42
 assert_status 1 'scheduler allocation disables login-node guard' \
-    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 SLURM_JOB_ID=123 bash -c 'source "$1"; is_login_node' _ "$ROOT/hpc_guard.sh"
+    is_login_host_in_allocation research-login07
 
 guard_output=''
 guard_status=0

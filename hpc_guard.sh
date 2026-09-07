@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HPCGuard v1.4.0
+# HPCGuard v1.4.1
 # Zero-root safety guard for AI coding agents & researchers on shared HPC clusters.
 # Supporting compute, storage, IDE, scheduler, and safe SSH liveness workflows.
 # ==============================================================================
@@ -15,7 +15,7 @@ BLUE='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-VERSION="v1.4.0"
+VERSION="v1.4.1"
 CONFIG_DIR="$HOME/.hpcguard"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 PID_FILE="$CONFIG_DIR/watchdog.pid"
@@ -24,7 +24,6 @@ LOG_FILE="$CONFIG_DIR/hpcguard.log"
 # --- Default Configurations ---
 CPU_SINGLE_LIMIT=80        # Single process CPU %
 CPU_AGGREGATE_LIMIT=200    # Total user aggregate CPU %
-MEM_LIMIT=80
 CHECK_INTERVAL=30
 AUTO_KILL=false
 PROBE_MIN_INTERVAL=60
@@ -39,7 +38,8 @@ fi
 
 # --- Helper Functions ---
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local msg
+    msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo -e "$msg"
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
@@ -536,9 +536,11 @@ install_alias() {
 
     if [ -n "$rc_file" ]; then
         if ! grep -q "hpcguard" "$rc_file"; then
-            echo "" >> "$rc_file"
-            echo "# Added by HPCGuard" >> "$rc_file"
-            echo "alias hpcguard=\"bash $script_path\"" >> "$rc_file"
+            {
+                echo ""
+                echo "# Added by HPCGuard"
+                echo "alias hpcguard=\"bash $script_path\""
+            } >> "$rc_file"
             echo -e "${GREEN}✅ Added alias 'hpcguard' to $rc_file.${NC}"
             echo -e "Run ${BLUE}source $rc_file${NC} or restart your shell to use ${BOLD}hpcguard${NC} directly."
         else
