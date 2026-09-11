@@ -1,0 +1,52 @@
+name: Bug report
+description: Report reproducible incorrect behavior that is not a policy-classification dispute.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve HPCGuard. Replace all real cluster identifiers with generic examples before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: HPCGuard version
+      placeholder: v1.4.1
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Anonymized environment
+      description: Include OS, shell, and scheduler family. Do not include hostnames, IP addresses, usernames, paths, or job IDs.
+      placeholder: Linux; Bash 5.x; Slurm
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Use generic hosts, paths, commands, and fixture data.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed real usernames, hostnames, IP addresses, home directories, job IDs, dataset paths, and unredacted logs.
+          required: true

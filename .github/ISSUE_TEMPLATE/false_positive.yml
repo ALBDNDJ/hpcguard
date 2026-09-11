@@ -1,0 +1,54 @@
+name: False positive or missed detection
+description: Report a safe command that was blocked, or a risky command that was missed.
+title: "[Policy]: "
+labels:
+  - policy
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Classification reports are most useful when they identify a precise safety boundary without exposing cluster details.
+  - type: dropdown
+    id: classification
+    attributes:
+      label: Classification problem
+      options:
+        - Safe command was blocked
+        - Risky command was allowed
+        - Warning or remediation was misleading
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: HPCGuard version
+      placeholder: v1.4.1
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Anonymized command
+      description: Replace real hosts and paths with values such as login01, cluster.example.edu, and /shared/example.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Why the classification is incorrect
+      description: Explain the observable resource or network behavior and whether the command ran on a login node or inside an allocation.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Suggested policy boundary
+      description: Describe a narrow condition that would fix this case without weakening unrelated protections.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed real usernames, hostnames, IP addresses, home directories, job IDs, dataset paths, and unredacted logs.
+          required: true

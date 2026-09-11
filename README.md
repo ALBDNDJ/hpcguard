@@ -4,6 +4,7 @@
 > Supporting Python ML/DL, R/Bioinformatics, Genomics Pipelines, VSCode Remote, Slurm Arrays, and safe SSH liveness checks.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/ALBDNDJ/hpcguard/actions/workflows/ci.yml/badge.svg)](https://github.com/ALBDNDJ/hpcguard/actions/workflows/ci.yml)
 [![Slurm Ready](https://img.shields.io/badge/Scheduler-Slurm-orange.svg)](#)
 [![Python, R, Genomics](https://img.shields.io/badge/Workloads-Python%20%7C%20R%20%7C%20Genomics-brightgreen.svg)](#)
 [![Zero Root Required](https://img.shields.io/badge/Root-Not_Required-green.svg)](#)

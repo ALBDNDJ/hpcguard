@@ -1,0 +1,41 @@
+name: New policy request
+description: Propose coverage for a recurring HPC safety failure mode.
+title: "[Rule]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: failure_mode
+    attributes:
+      label: Failure mode
+      description: Describe the observable behavior, affected shared resource, and likely impact.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Anonymized minimal example
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: detection
+    attributes:
+      label: Proposed detection signal
+      description: Prefer measurable process, command, scheduler, storage, or network signals over a long tool-name list.
+    validations:
+      required: true
+  - type: textarea
+    id: false_positives
+    attributes:
+      label: Expected false-positive boundary
+      description: Identify legitimate workloads that the proposed rule must continue to allow.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed real usernames, hostnames, IP addresses, home directories, job IDs, dataset paths, and unredacted logs.
+          required: true
