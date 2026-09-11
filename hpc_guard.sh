@@ -389,7 +389,7 @@ protected_process_name() {
 
 terminate_verified_process() {
     local pid=$1 expected_name=$2 expected_start=$3
-    local current_uid current_name current_start attempt
+    local current_uid current_name current_start
     current_uid=$(ps -p "$pid" -o uid= 2>/dev/null | awk '{print $1}')
     current_name=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{print $1}')
     current_start=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -400,7 +400,7 @@ terminate_verified_process() {
     protected_process_name "$current_name" && return 1
 
     kill -TERM "$pid" 2>/dev/null || return 1
-    for attempt in 1 2 3; do
+    for _ in 1 2 3; do
         kill -0 "$pid" 2>/dev/null || return 0
         sleep 1
     done
@@ -484,7 +484,7 @@ start_watchdog() {
 }
 
 stop_watchdog() {
-    local pid attempt
+    local pid
     if ! watchdog_is_running; then
         echo -e "${YELLOW}Watchdog is not running; stale state was removed.${NC}"
         rm -f "$PID_FILE"
@@ -492,7 +492,7 @@ stop_watchdog() {
     fi
     pid=$(watchdog_pid)
     kill -TERM "$pid" 2>/dev/null || true
-    for attempt in 1 2 3; do
+    for _ in 1 2 3; do
         watchdog_process_matches "$pid" || break
         sleep 1
     done
