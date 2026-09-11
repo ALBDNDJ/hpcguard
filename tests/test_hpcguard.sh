@@ -96,6 +96,24 @@ assert_status 1 'lightweight help command remains allowed' \
     classify_on_login 'samtools view --help'
 assert_status 1 'bounded project find remains allowed' \
     classify_on_login 'find ./project -maxdepth 2 -type f'
+assert_status 0 'Python multiprocessing pool is blocked' \
+    classify_on_login 'python -c "import multiprocessing; multiprocessing.Pool(32).map(work, items)"'
+assert_status 0 'concurrent futures process pool is blocked' \
+    classify_on_login 'python -c "from concurrent.futures import ProcessPoolExecutor; ProcessPoolExecutor(32)"'
+assert_status 0 'unbounded joblib fan-out is blocked' \
+    classify_on_login 'python -c "joblib.Parallel(n_jobs=-1)(tasks)"'
+assert_status 1 'CPU-count inspection is not mistaken for process fan-out' \
+    classify_on_login 'python -c "import multiprocessing; print(multiprocessing.cpu_count())"'
+assert_status 0 'high-concurrency xargs is blocked' \
+    classify_on_login 'find ./project -type f -print0 | xargs -0 -P 32 process'
+assert_status 1 'bounded xargs concurrency remains allowed' \
+    classify_on_login 'find ./project -type f -print0 | xargs -0 -P 4 process'
+assert_status 0 'tight Slurm submission loop is blocked' \
+    classify_on_login 'while true; do sbatch job.slurm; sleep 5; done'
+assert_status 1 'one-shot Slurm submission is not classified as a loop' \
+    classify_on_login 'sbatch job.slurm'
+assert_status 1 'Slurm loop with configured backoff is not blocked' \
+    classify_on_login 'while retry; do sbatch job.slurm; sleep 60; done'
 
 guard_output=''
 guard_status=0
@@ -109,13 +127,32 @@ check_output=$(HPCGUARD_HOSTNAME_OVERRIDE=research-login07 check_command -- torc
 assert_eq 101 "$check_status" 'machine-readable check returns block status'
 assert_contains "$check_output" '"decision":"block"' 'machine-readable check emits block decision'
 
-check_output=$(HPCGUARD_HOSTNAME_OVERRIDE=workstation42 check_command -- printf ok)
+check_status=0
+check_output=$(HPCGUARD_HOSTNAME_OVERRIDE=workstation42 check_command -- printf ok) || check_status=$?
+assert_eq 104 "$check_status" 'unknown host fails closed for agent integrations'
 assert_contains "$check_output" '"decision":"unclassified"' 'unknown host is explicit in machine-readable output'
 
-run_output=$(HPCGUARD_HOSTNAME_OVERRIDE=workstation42 run_command -- printf '<%s>\n' 'argument with spaces' ";touch $TEST_TMP/argv-injection-ran")
+run_output=$(HPCGUARD_HOSTNAME_OVERRIDE=research-login07 SLURM_JOB_ID=123 run_command -- printf '<%s>\n' 'argument with spaces' ";touch $TEST_TMP/argv-injection-ran")
 expected_run_output=$(printf '<%s>\n' 'argument with spaces' ";touch $TEST_TMP/argv-injection-ran")
 assert_eq "$expected_run_output" "$run_output" 'argv execution preserves boundaries without shell evaluation'
 assert_status 1 'argv metacharacters did not create a file' test -e "$TEST_TMP/argv-injection-ran"
+
+assert_status 1 'first failed command preserves its original status' \
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; run_command -- false retry-secret-marker' _ "$ROOT/hpc_guard.sh"
+assert_status 103 'immediate repeat failure is rate-limited' \
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; run_command -- false retry-secret-marker' _ "$ROOT/hpc_guard.sh"
+assert_status 1 'reviewed force-retry bypasses only the backoff' \
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; run_command --force-retry -- false retry-secret-marker' _ "$ROOT/hpc_guard.sh"
+assert_status 1 'failure state does not store raw command arguments' grep -q 'retry-secret-marker' "$FAILURE_STATE_FILE"
+
+SUBMIT_MAX_COUNT=2
+SUBMIT_WINDOW_SECONDS=60
+assert_status 0 'first wrapped sbatch attempt is admitted' \
+    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm' _ "$ROOT/hpc_guard.sh"
+assert_status 0 'second wrapped sbatch attempt is admitted' \
+    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm' _ "$ROOT/hpc_guard.sh"
+assert_status 102 'submission storm is blocked at the rolling limit' \
+    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm' _ "$ROOT/hpc_guard.sh"
 
 probe_output=''
 probe_status=0
@@ -133,14 +170,32 @@ assert_status 1 'PID file cannot claim an unrelated process' watchdog_is_running
 printf '%s\n' \
     'CPU_SINGLE_LIMIT=95' \
     'CPU_AGGREGATE_LIMIT=invalid' \
+    'MEM_SINGLE_LIMIT_MB=4096' \
+    'MEM_AGGREGATE_LIMIT_MB=12288' \
+    'PROCESS_COUNT_LIMIT=48' \
+    'RETRY_BACKOFF_SECONDS=120' \
+    'SUBMIT_WINDOW_SECONDS=90' \
+    'SUBMIT_MAX_COUNT=3' \
     'AUTO_KILL=true' \
     "UNKNOWN_KEY=\$(touch $TEST_TMP/config-injection-ran)" > "$CONFIG_FILE"
 CPU_SINGLE_LIMIT=80
 CPU_AGGREGATE_LIMIT=200
+MEM_SINGLE_LIMIT_MB=8192
+MEM_AGGREGATE_LIMIT_MB=16384
+PROCESS_COUNT_LIMIT=64
+RETRY_BACKOFF_SECONDS=60
+SUBMIT_WINDOW_SECONDS=60
+SUBMIT_MAX_COUNT=5
 AUTO_KILL=false
 load_config 2>/dev/null
 assert_eq 95 "$CPU_SINGLE_LIMIT" 'configuration parser accepts validated integer'
 assert_eq 200 "$CPU_AGGREGATE_LIMIT" 'configuration parser rejects invalid integer'
+assert_eq 4096 "$MEM_SINGLE_LIMIT_MB" 'configuration parser accepts single-process memory warning'
+assert_eq 12288 "$MEM_AGGREGATE_LIMIT_MB" 'configuration parser accepts aggregate memory warning'
+assert_eq 48 "$PROCESS_COUNT_LIMIT" 'configuration parser accepts process-count warning'
+assert_eq 120 "$RETRY_BACKOFF_SECONDS" 'configuration parser accepts retry backoff'
+assert_eq 90 "$SUBMIT_WINDOW_SECONDS" 'configuration parser accepts submission window'
+assert_eq 3 "$SUBMIT_MAX_COUNT" 'configuration parser accepts submission rate'
 assert_eq true "$AUTO_KILL" 'configuration parser accepts strict boolean'
 assert_status 1 'configuration values are never executed as shell code' test -e "$TEST_TMP/config-injection-ran"
 

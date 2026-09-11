@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HPCGuard v1.5.0
+# HPCGuard v1.6.0
 # Zero-root safety guard for AI coding agents & researchers on shared HPC clusters.
 # Supporting compute, storage, IDE, scheduler, and safe SSH liveness workflows.
 # ==============================================================================
@@ -15,19 +15,28 @@ BLUE='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-VERSION="v1.5.0"
+VERSION="v1.6.0"
 CONFIG_DIR="${HPCGUARD_CONFIG_DIR:-$HOME/.hpcguard}"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 PID_FILE="$CONFIG_DIR/watchdog.pid"
 LOG_FILE="$CONFIG_DIR/hpcguard.log"
 START_LOCK_DIR="$CONFIG_DIR/watchdog.start.lock"
+FAILURE_STATE_FILE="$CONFIG_DIR/failed-command.state"
+SUBMIT_STATE_FILE="$CONFIG_DIR/submission.events"
+SUBMIT_LOCK_DIR="$CONFIG_DIR/submission.lock"
 
 # --- Default Configurations ---
 CPU_SINGLE_LIMIT=80        # Single process CPU %
 CPU_AGGREGATE_LIMIT=200    # Total user aggregate CPU %
+MEM_SINGLE_LIMIT_MB=8192    # Single-process resident memory warning
+MEM_AGGREGATE_LIMIT_MB=16384 # Account-wide resident memory warning
+PROCESS_COUNT_LIMIT=64      # Account-wide process-count warning
 CHECK_INTERVAL=30
 AUTO_KILL=false
 PROBE_MIN_INTERVAL=60
+RETRY_BACKOFF_SECONDS=60
+SUBMIT_WINDOW_SECONDS=60
+SUBMIT_MAX_COUNT=5
 LOGIN_HOST_REGEX='(^|[-_])(login|head|gateway|mgmt|master|ln)([-_.0-9]|$)'
 
 if [ -L "$CONFIG_DIR" ]; then
@@ -79,11 +88,29 @@ load_config() {
             CPU_AGGREGATE_LIMIT)
                 if valid_integer "$value" 1 100000; then CPU_AGGREGATE_LIMIT=$value; else config_warning "invalid CPU_AGGREGATE_LIMIT"; fi
                 ;;
+            MEM_SINGLE_LIMIT_MB)
+                if valid_integer "$value" 1 1048576; then MEM_SINGLE_LIMIT_MB=$value; else config_warning "invalid MEM_SINGLE_LIMIT_MB"; fi
+                ;;
+            MEM_AGGREGATE_LIMIT_MB)
+                if valid_integer "$value" 1 4194304; then MEM_AGGREGATE_LIMIT_MB=$value; else config_warning "invalid MEM_AGGREGATE_LIMIT_MB"; fi
+                ;;
+            PROCESS_COUNT_LIMIT)
+                if valid_integer "$value" 1 100000; then PROCESS_COUNT_LIMIT=$value; else config_warning "invalid PROCESS_COUNT_LIMIT"; fi
+                ;;
             CHECK_INTERVAL)
                 if valid_integer "$value" 1 3600; then CHECK_INTERVAL=$value; else config_warning "invalid CHECK_INTERVAL"; fi
                 ;;
             PROBE_MIN_INTERVAL)
                 if valid_integer "$value" 1 86400; then PROBE_MIN_INTERVAL=$value; else config_warning "invalid PROBE_MIN_INTERVAL"; fi
+                ;;
+            RETRY_BACKOFF_SECONDS)
+                if valid_integer "$value" 1 86400; then RETRY_BACKOFF_SECONDS=$value; else config_warning "invalid RETRY_BACKOFF_SECONDS"; fi
+                ;;
+            SUBMIT_WINDOW_SECONDS)
+                if valid_integer "$value" 1 86400; then SUBMIT_WINDOW_SECONDS=$value; else config_warning "invalid SUBMIT_WINDOW_SECONDS"; fi
+                ;;
+            SUBMIT_MAX_COUNT)
+                if valid_integer "$value" 1 10000; then SUBMIT_MAX_COUNT=$value; else config_warning "invalid SUBMIT_MAX_COUNT"; fi
                 ;;
             AUTO_KILL)
                 if [ "$value" = true ] || [ "$value" = false ]; then AUTO_KILL=$value; else config_warning "invalid AUTO_KILL"; fi
@@ -103,8 +130,14 @@ save_config() {
     {
         printf 'CPU_SINGLE_LIMIT=%s\n' "$CPU_SINGLE_LIMIT"
         printf 'CPU_AGGREGATE_LIMIT=%s\n' "$CPU_AGGREGATE_LIMIT"
+        printf 'MEM_SINGLE_LIMIT_MB=%s\n' "$MEM_SINGLE_LIMIT_MB"
+        printf 'MEM_AGGREGATE_LIMIT_MB=%s\n' "$MEM_AGGREGATE_LIMIT_MB"
+        printf 'PROCESS_COUNT_LIMIT=%s\n' "$PROCESS_COUNT_LIMIT"
         printf 'CHECK_INTERVAL=%s\n' "$CHECK_INTERVAL"
         printf 'PROBE_MIN_INTERVAL=%s\n' "$PROBE_MIN_INTERVAL"
+        printf 'RETRY_BACKOFF_SECONDS=%s\n' "$RETRY_BACKOFF_SECONDS"
+        printf 'SUBMIT_WINDOW_SECONDS=%s\n' "$SUBMIT_WINDOW_SECONDS"
+        printf 'SUBMIT_MAX_COUNT=%s\n' "$SUBMIT_MAX_COUNT"
         printf 'AUTO_KILL=%s\n' "$AUTO_KILL"
         printf 'LOGIN_HOST_REGEX=%s\n' "$LOGIN_HOST_REGEX"
     } > "$temporary"
@@ -122,7 +155,7 @@ log() {
 }
 
 node_class() {
-    if [ -n "${SLURM_JOB_ID:-}" ] || [ -n "${PBS_JOBID:-}" ]; then
+    if [ -n "${SLURM_JOB_ID:-}" ]; then
         printf 'allocation\n'
         return 0
     fi
@@ -175,6 +208,40 @@ is_high_frequency_ssh_probe() {
     [ -z "$interval" ] || [ "$interval" -lt "$PROBE_MIN_INTERVAL" ]
 }
 
+is_high_concurrency_launcher() {
+    local target_cmd=$1 workers=""
+
+    if [[ "$target_cmd" =~ (^|[[:space:];|/])xargs[[:space:]].*-P[[:space:]=]*([0-9]+) ]]; then
+        workers=${BASH_REMATCH[2]}
+    elif [[ "$target_cmd" =~ (^|[[:space:];|/])parallel[[:space:]].*(-j|--jobs)[[:space:]=]*([0-9]+) ]]; then
+        workers=${BASH_REMATCH[3]}
+    elif [[ "$target_cmd" =~ (--workers|--jobs|--nproc_per_node)[[:space:]=]+([0-9]+) ]]; then
+        workers=${BASH_REMATCH[2]}
+    fi
+
+    [ -n "$workers" ] && [ "$workers" -ge 16 ]
+}
+
+is_python_process_fanout() {
+    local target_cmd=$1
+    [[ "$target_cmd" =~ (multiprocessing\.(Pool|Process)|ProcessPoolExecutor|torch\.multiprocessing|joblib\.Parallel) ]] ||
+        [[ "$target_cmd" =~ Parallel\(.*n_jobs[[:space:]]*=[[:space:]]*(-1|[1-9][0-9]+) ]]
+}
+
+is_high_frequency_scheduler_loop() {
+    local target_cmd=$1 interval=""
+    [[ "$target_cmd" =~ (^|[[:space:];])(while|until|for|watch)([[:space:]]|$) ]] || return 1
+    [[ "$target_cmd" =~ (^|[[:space:];|/])(sbatch|srun)([[:space:]]|$) ]] || return 1
+
+    if [[ "$target_cmd" =~ sleep[[:space:]]+([0-9]+)(s)?([[:space:];]|$) ]]; then
+        interval=${BASH_REMATCH[1]}
+    elif [[ "$target_cmd" =~ watch[[:space:]]+(-n|--interval)[=[:space:]]+([0-9]+) ]]; then
+        interval=${BASH_REMATCH[2]}
+    fi
+
+    [ -z "$interval" ] || [ "$interval" -lt "$RETRY_BACKOFF_SECONDS" ]
+}
+
 # --- Module 1: Command Pre-execution Guard ---
 POLICY_REASON=""
 POLICY_SUGGESTION=""
@@ -188,6 +255,22 @@ classify_command() {
     if is_high_frequency_ssh_probe "$target_cmd"; then
         POLICY_REASON="High-frequency TCP/SSH liveness probing can create repeated pre-authentication reset logs and trigger IDS alerts."
         POLICY_SUGGESTION="Reuse an existing SSH ControlMaster with 'hpcguard probe <ssh-host>', or use a scheduler/event-driven check."
+
+    elif is_high_frequency_scheduler_loop "$target_cmd"; then
+        POLICY_REASON="A tight Slurm submission or launch loop can overload the scheduler and amplify repeated failures."
+        POLICY_SUGGESTION="Use a rate-limited Slurm array or add an explicit backoff of at least $RETRY_BACKOFF_SECONDS seconds after diagnosing the failure."
+
+    elif [[ "$target_cmd" == *':(){ :|:& };:'* ]]; then
+        POLICY_REASON="A shell fork-bomb pattern was detected."
+        POLICY_SUGGESTION="Do not execute recursive process-spawning expressions on a shared system."
+
+    elif is_python_process_fanout "$target_cmd"; then
+        POLICY_REASON="Python multiprocessing or process-pool fan-out was detected on a login node."
+        POLICY_SUGGESTION="Run the workload in a Slurm allocation with an explicit CPU and memory request."
+
+    elif is_high_concurrency_launcher "$target_cmd"; then
+        POLICY_REASON="A high-concurrency process launcher was detected on a login node."
+        POLICY_SUGGESTION="Reduce concurrency below 16 workers or request the required CPUs through Slurm."
 
     elif [[ "$target_cmd" =~ (torchrun|accelerate[[:space:]]+launch|deepspeed|mpirun|horovodrun) ]]; then
         POLICY_REASON="Distributed ML training framework detected on login node."
@@ -255,6 +338,82 @@ json_escape() {
     printf '%s' "$value"
 }
 
+command_fingerprint() {
+    printf '%s\0' "$@" | cksum | awk '{print $1 ":" $2}'
+}
+
+recent_failure_status() {
+    [ -f "$FAILURE_STATE_FILE" ] && [ ! -L "$FAILURE_STATE_FILE" ] || return 1
+    local recorded_at recorded_fingerprint recorded_status now fingerprint
+    IFS=$'\t' read -r recorded_at recorded_fingerprint recorded_status < "$FAILURE_STATE_FILE" || return 1
+    [[ "$recorded_at" =~ ^[0-9]+$ ]] || return 1
+    [[ "$recorded_status" =~ ^[0-9]+$ ]] || return 1
+    fingerprint=$(command_fingerprint "$@")
+    [ "$fingerprint" = "$recorded_fingerprint" ] || return 1
+    now=$(date +%s)
+    [ $((now - recorded_at)) -lt "$RETRY_BACKOFF_SECONDS" ] || return 1
+    printf '%s\n' "$recorded_status"
+}
+
+record_command_failure() {
+    local status=$1 temporary fingerprint
+    shift
+    fingerprint=$(command_fingerprint "$@")
+    temporary=$(mktemp "$CONFIG_DIR/failed-command.tmp.XXXXXX") || return 1
+    chmod 600 "$temporary" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$fingerprint" "$status" > "$temporary"
+    mv -f "$temporary" "$FAILURE_STATE_FILE"
+}
+
+clear_matching_failure() {
+    [ -f "$FAILURE_STATE_FILE" ] && [ ! -L "$FAILURE_STATE_FILE" ] || return 0
+    local _ recorded_fingerprint fingerprint
+    IFS=$'\t' read -r _ recorded_fingerprint _ < "$FAILURE_STATE_FILE" || return 0
+    fingerprint=$(command_fingerprint "$@")
+    if [ "$fingerprint" = "$recorded_fingerprint" ]; then
+        rm -f "$FAILURE_STATE_FILE"
+    fi
+}
+
+reserve_submission_slot() {
+    local now cutoff temporary count=0 timestamp
+    now=$(date +%s)
+    cutoff=$((now - SUBMIT_WINDOW_SECONDS))
+    mkdir "$SUBMIT_LOCK_DIR" 2>/dev/null || return 2
+    temporary=$(mktemp "$CONFIG_DIR/submission.events.tmp.XXXXXX") || {
+        rmdir "$SUBMIT_LOCK_DIR" 2>/dev/null || true
+        return 2
+    }
+    chmod 600 "$temporary" 2>/dev/null || true
+
+    if [ -f "$SUBMIT_STATE_FILE" ] && [ ! -L "$SUBMIT_STATE_FILE" ]; then
+        while IFS= read -r timestamp; do
+            if [[ "$timestamp" =~ ^[0-9]+$ ]] && [ "$timestamp" -ge "$cutoff" ]; then
+                printf '%s\n' "$timestamp" >> "$temporary"
+                count=$((count + 1))
+            fi
+        done < "$SUBMIT_STATE_FILE"
+    fi
+
+    if [ "$count" -ge "$SUBMIT_MAX_COUNT" ]; then
+        mv -f "$temporary" "$SUBMIT_STATE_FILE"
+        rmdir "$SUBMIT_LOCK_DIR" 2>/dev/null || true
+        return 1
+    fi
+
+    printf '%s\n' "$now" >> "$temporary"
+    mv -f "$temporary" "$SUBMIT_STATE_FILE"
+    rmdir "$SUBMIT_LOCK_DIR" 2>/dev/null || true
+    return 0
+}
+
+render_runtime_block() {
+    local target_cmd=$1 title=$2 reason=$3 suggestion=$4
+    POLICY_REASON=$reason
+    POLICY_SUGGESTION=$suggestion
+    render_block "$target_cmd" | sed "s/\[HPCGuard: BLOCKED ON LOGIN NODE\]/[HPCGuard: $title]/"
+}
+
 check_command() {
     [ "${1:-}" = --json ] && shift
     [ "${1:-}" = -- ] && shift
@@ -277,6 +436,7 @@ check_command() {
         decision=unclassified
         reason="Host is not recognized as a login node or scheduler allocation."
         suggestion="Configure LOGIN_HOST_REGEX before relying on enforcement."
+        status=104
     fi
     printf '{"decision":"%s","node_class":"%s","reason":"%s","suggestion":"%s"}\n' \
         "$decision" "$class" "$(json_escape "$reason")" "$(json_escape "$suggestion")"
@@ -284,18 +444,58 @@ check_command() {
 }
 
 run_command() {
+    local force_retry=false
+    if [ "${1:-}" = --force-retry ]; then
+        force_retry=true
+        shift
+    fi
     [ "${1:-}" = -- ] && shift
     if [ "$#" -eq 0 ]; then
-        echo 'Usage: hpcguard run -- <command> [args...]' >&2
+        echo 'Usage: hpcguard run [--force-retry] -- <command> [args...]' >&2
         return 2
     fi
-    local target_cmd
+    local target_cmd class failed_status executable reserve_status=0 command_status=0
     target_cmd=$(join_argv "$@")
-    if is_login_node && classify_command "$target_cmd"; then
+    class=$(node_class)
+    if [ "$class" = unknown ]; then
+        render_runtime_block "$target_cmd" "UNCLASSIFIED HOST" \
+            "Host is not recognized as a login node or scheduler allocation." \
+            "Configure LOGIN_HOST_REGEX before asking an agent to execute commands."
+        return 104
+    fi
+    if [ "$class" = login ] && classify_command "$target_cmd"; then
         render_block "$target_cmd"
         return 101
     fi
-    command "$@"
+    if [ "$class" = login ] && [ "$force_retry" = false ]; then
+        failed_status=$(recent_failure_status "$@" || true)
+        if [ -n "$failed_status" ]; then
+            render_runtime_block "$target_cmd" "RETRY BACKOFF" \
+                "The same command failed with exit status $failed_status less than $RETRY_BACKOFF_SECONDS seconds ago." \
+                "Diagnose the failure first, wait for the backoff, or explicitly use --force-retry after review."
+            return 103
+        fi
+    fi
+
+    executable=${1##*/}
+    if [ "$class" = login ] && [ "$executable" = sbatch ]; then
+        reserve_submission_slot || reserve_status=$?
+        if [ "$reserve_status" -ne 0 ]; then
+            render_runtime_block "$target_cmd" "SUBMISSION RATE LIMIT" \
+                "The account reached its local limit of $SUBMIT_MAX_COUNT sbatch attempts in $SUBMIT_WINDOW_SECONDS seconds." \
+                "Stop the submission loop, inspect failed jobs, and retry after the rolling window expires."
+            return 102
+        fi
+    fi
+
+    if command "$@"; then
+        [ "$class" = login ] && clear_matching_failure "$@"
+        return 0
+    else
+        command_status=$?
+        [ "$class" = login ] && record_command_failure "$command_status" "$@"
+        return "$command_status"
+    fi
 }
 
 # Compatibility interface for pipelines and compound shell syntax. Prefer
@@ -308,7 +508,15 @@ cmd_exec_guard() {
         return 2
     fi
 
-    if is_login_node && classify_command "$target_cmd"; then
+    local class
+    class=$(node_class)
+    if [ "$class" = unknown ]; then
+        render_runtime_block "$target_cmd" "UNCLASSIFIED HOST" \
+            "Host is not recognized as a login node or scheduler allocation." \
+            "Configure LOGIN_HOST_REGEX before asking an agent to execute commands."
+        return 104
+    fi
+    if [ "$class" = login ] && classify_command "$target_cmd"; then
         render_block "$target_cmd"
         return 101
     fi
@@ -412,9 +620,9 @@ terminate_verified_process() {
 
 watchdog_loop() {
     trap 'exit 0' TERM INT HUP
-    local pid cpu name started total_cpu d_pids lsp_pids
+    local pid cpu rss name started total_cpu total_memory process_count d_pids lsp_pids
     while true; do
-        while read -r pid cpu name; do
+        while read -r pid cpu rss name; do
             [ -n "$pid" ] || continue
             if awk -v value="$cpu" -v limit="$CPU_SINGLE_LIMIT" 'BEGIN {exit !(value >= limit)}'; then
                 log "[SINGLE PROCESS OVERLOAD] Process $name (PID $pid) exceeded $CPU_SINGLE_LIMIT% CPU on a login node."
@@ -427,11 +635,24 @@ watchdog_loop() {
                     fi
                 fi
             fi
-        done < <(ps -u "$(id -un)" -o pid=,pcpu=,comm= 2>/dev/null || true)
+            if [[ "$rss" =~ ^[0-9]+$ ]] && [ $((rss / 1024)) -ge "$MEM_SINGLE_LIMIT_MB" ]; then
+                log "[SINGLE PROCESS MEMORY] Process $name (PID $pid) uses $((rss / 1024)) MiB RSS (warning: $MEM_SINGLE_LIMIT_MB MiB)."
+            fi
+        done < <(ps -u "$(id -un)" -o pid=,pcpu=,rss=,comm= 2>/dev/null || true)
 
         total_cpu=$(ps -u "$(id -un)" -o pcpu= 2>/dev/null | awk '{sum += $1} END {print int(sum)}')
         if [ -n "$total_cpu" ] && [ "$total_cpu" -ge "$CPU_AGGREGATE_LIMIT" ]; then
             log "[AGGREGATE OVERLOAD] Account CPU reached $total_cpu% (limit: $CPU_AGGREGATE_LIMIT%)."
+        fi
+
+        total_memory=$(ps -u "$(id -un)" -o rss= 2>/dev/null | awk '{sum += $1} END {print int(sum / 1024)}')
+        if [ -n "$total_memory" ] && [ "$total_memory" -ge "$MEM_AGGREGATE_LIMIT_MB" ]; then
+            log "[AGGREGATE MEMORY] Account RSS reached $total_memory MiB (warning: $MEM_AGGREGATE_LIMIT_MB MiB)."
+        fi
+
+        process_count=$(ps -u "$(id -un)" -o pid= 2>/dev/null | awk 'END {print NR + 0}')
+        if [ -n "$process_count" ] && [ "$process_count" -ge "$PROCESS_COUNT_LIMIT" ]; then
+            log "[PROCESS FAN-OUT] Account has $process_count processes (warning: $PROCESS_COUNT_LIMIT)."
         fi
 
         d_pids=$(ps -u "$(id -un)" -o pid=,stat= 2>/dev/null | awk '$2 ~ /^D/ {print $1}' | paste -sd, -)
@@ -520,7 +741,12 @@ status_watchdog() {
         echo -e "Watchdog:         ${RED}Stopped${NC}"
     fi
     echo -e "Single CPU Limit: ${BOLD}${CPU_SINGLE_LIMIT}%${NC}"
-    echo -e "Aggregate Limit:  ${BOLD}${CPU_AGGREGATE_LIMIT}%${NC}"
+    echo -e "Aggregate CPU:     ${BOLD}${CPU_AGGREGATE_LIMIT}%${NC}"
+    echo -e "Single Memory:     ${BOLD}${MEM_SINGLE_LIMIT_MB} MiB RSS${NC}"
+    echo -e "Aggregate Memory:  ${BOLD}${MEM_AGGREGATE_LIMIT_MB} MiB RSS${NC}"
+    echo -e "Process Count:     ${BOLD}${PROCESS_COUNT_LIMIT}${NC}"
+    echo -e "Retry Backoff:     ${BOLD}${RETRY_BACKOFF_SECONDS}s${NC}"
+    echo -e "Submission Rate:   ${BOLD}${SUBMIT_MAX_COUNT}/${SUBMIT_WINDOW_SECONDS}s${NC}"
     echo -e "Auto-Kill Mode:   ${BOLD}$AUTO_KILL${NC}"
     echo -e "Log File:         $LOG_FILE\n"
 }
