@@ -138,21 +138,21 @@ assert_eq "$expected_run_output" "$run_output" 'argv execution preserves boundar
 assert_status 1 'argv metacharacters did not create a file' test -e "$TEST_TMP/argv-injection-ran"
 
 assert_status 1 'first failed command preserves its original status' \
-    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; run_command -- false retry-secret-marker' _ "$ROOT/hpc_guard.sh"
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c "source \"$ROOT/hpc_guard.sh\"; run_command -- false retry-secret-marker"
 assert_status 103 'immediate repeat failure is rate-limited' \
-    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; run_command -- false retry-secret-marker' _ "$ROOT/hpc_guard.sh"
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c "source \"$ROOT/hpc_guard.sh\"; run_command -- false retry-secret-marker"
 assert_status 1 'reviewed force-retry bypasses only the backoff' \
-    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; run_command --force-retry -- false retry-secret-marker' _ "$ROOT/hpc_guard.sh"
+    env HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c "source \"$ROOT/hpc_guard.sh\"; run_command --force-retry -- false retry-secret-marker"
 assert_status 1 'failure state does not store raw command arguments' grep -q 'retry-secret-marker' "$FAILURE_STATE_FILE"
 
 SUBMIT_MAX_COUNT=2
 SUBMIT_WINDOW_SECONDS=60
 assert_status 0 'first wrapped sbatch attempt is admitted' \
-    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm' _ "$ROOT/hpc_guard.sh"
+    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c "source \"$ROOT/hpc_guard.sh\"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm"
 assert_status 0 'second wrapped sbatch attempt is admitted' \
-    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm' _ "$ROOT/hpc_guard.sh"
+    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c "source \"$ROOT/hpc_guard.sh\"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm"
 assert_status 102 'submission storm is blocked at the rolling limit' \
-    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c 'source "$1"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm' _ "$ROOT/hpc_guard.sh"
+    env PATH="$ROOT/tests/fixtures:$PATH" HPCGUARD_HOSTNAME_OVERRIDE=research-login07 bash -c "source \"$ROOT/hpc_guard.sh\"; SUBMIT_MAX_COUNT=2; run_command -- sbatch job.slurm"
 
 probe_output=''
 probe_status=0
