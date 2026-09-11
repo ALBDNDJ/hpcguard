@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# HPCGuard v1.4.1
+# HPCGuard v1.5.0
 # Zero-root safety guard for AI coding agents & researchers on shared HPC clusters.
 # Supporting compute, storage, IDE, scheduler, and safe SSH liveness workflows.
 # ==============================================================================
@@ -15,11 +15,12 @@ BLUE='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
-VERSION="v1.4.1"
-CONFIG_DIR="$HOME/.hpcguard"
+VERSION="v1.5.0"
+CONFIG_DIR="${HPCGUARD_CONFIG_DIR:-$HOME/.hpcguard}"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 PID_FILE="$CONFIG_DIR/watchdog.pid"
 LOG_FILE="$CONFIG_DIR/hpcguard.log"
+START_LOCK_DIR="$CONFIG_DIR/watchdog.start.lock"
 
 # --- Default Configurations ---
 CPU_SINGLE_LIMIT=80        # Single process CPU %
@@ -29,12 +30,88 @@ AUTO_KILL=false
 PROBE_MIN_INTERVAL=60
 LOGIN_HOST_REGEX='(^|[-_])(login|head|gateway|mgmt|master|ln)([-_.0-9]|$)'
 
-mkdir -p "$CONFIG_DIR"
-
-if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+if [ -L "$CONFIG_DIR" ]; then
+    echo "HPCGuard refuses a symlinked configuration directory: $CONFIG_DIR" >&2
+    exit 1
 fi
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+
+config_warning() {
+    printf 'HPCGuard config warning: %s\n' "$1" >&2
+}
+
+valid_integer() {
+    local value=$1 minimum=$2 maximum=$3
+    [[ "$value" =~ ^[0-9]+$ ]] &&
+        [ "$value" -ge "$minimum" ] &&
+        [ "$value" -le "$maximum" ]
+}
+
+load_config() {
+    [ -e "$CONFIG_FILE" ] || return 0
+    if [ -L "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
+        config_warning "ignored non-regular or symlinked file: $CONFIG_FILE"
+        return 0
+    fi
+
+    local owner_uid
+    owner_uid=$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null || stat -f '%u' "$CONFIG_FILE" 2>/dev/null || true)
+    if [ -z "$owner_uid" ] || [ "$owner_uid" != "$(id -u)" ]; then
+        config_warning "ignored file not owned by the current user: $CONFIG_FILE"
+        return 0
+    fi
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) config_warning "ignored malformed line"; continue ;;
+        esac
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            CPU_SINGLE_LIMIT)
+                if valid_integer "$value" 1 10000; then CPU_SINGLE_LIMIT=$value; else config_warning "invalid CPU_SINGLE_LIMIT"; fi
+                ;;
+            CPU_AGGREGATE_LIMIT)
+                if valid_integer "$value" 1 100000; then CPU_AGGREGATE_LIMIT=$value; else config_warning "invalid CPU_AGGREGATE_LIMIT"; fi
+                ;;
+            CHECK_INTERVAL)
+                if valid_integer "$value" 1 3600; then CHECK_INTERVAL=$value; else config_warning "invalid CHECK_INTERVAL"; fi
+                ;;
+            PROBE_MIN_INTERVAL)
+                if valid_integer "$value" 1 86400; then PROBE_MIN_INTERVAL=$value; else config_warning "invalid PROBE_MIN_INTERVAL"; fi
+                ;;
+            AUTO_KILL)
+                if [ "$value" = true ] || [ "$value" = false ]; then AUTO_KILL=$value; else config_warning "invalid AUTO_KILL"; fi
+                ;;
+            LOGIN_HOST_REGEX)
+                if [ -n "$value" ] && [ "${#value}" -le 256 ]; then LOGIN_HOST_REGEX=$value; else config_warning "invalid LOGIN_HOST_REGEX"; fi
+                ;;
+            *) config_warning "ignored unknown key: $key" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+save_config() {
+    local temporary
+    temporary=$(mktemp "$CONFIG_DIR/config.env.tmp.XXXXXX") || return 1
+    chmod 600 "$temporary" 2>/dev/null || true
+    {
+        printf 'CPU_SINGLE_LIMIT=%s\n' "$CPU_SINGLE_LIMIT"
+        printf 'CPU_AGGREGATE_LIMIT=%s\n' "$CPU_AGGREGATE_LIMIT"
+        printf 'CHECK_INTERVAL=%s\n' "$CHECK_INTERVAL"
+        printf 'PROBE_MIN_INTERVAL=%s\n' "$PROBE_MIN_INTERVAL"
+        printf 'AUTO_KILL=%s\n' "$AUTO_KILL"
+        printf 'LOGIN_HOST_REGEX=%s\n' "$LOGIN_HOST_REGEX"
+    } > "$temporary"
+    mv -f "$temporary" "$CONFIG_FILE"
+}
+
+load_config
 
 # --- Helper Functions ---
 log() {
@@ -44,16 +121,22 @@ log() {
     echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-is_login_node() {
-    # 1. If currently inside a Slurm/PBS batch or interactive allocation, it is a compute node
+node_class() {
     if [ -n "${SLURM_JOB_ID:-}" ] || [ -n "${PBS_JOBID:-}" ]; then
-        return 1
+        printf 'allocation\n'
+        return 0
     fi
-    # 2. Match only explicit login/head naming patterns. Unknown hosts are not
-    # silently classified as login nodes; sites can override LOGIN_HOST_REGEX.
     local host
     host=${HPCGUARD_HOSTNAME_OVERRIDE:-$(hostname -s 2>/dev/null || hostname)}
-    [[ "$host" =~ $LOGIN_HOST_REGEX ]]
+    if [[ "$host" =~ $LOGIN_HOST_REGEX ]]; then
+        printf 'login\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
+is_login_node() {
+    [ "$(node_class)" = login ]
 }
 
 # Detect tight TCP/SSH liveness loops before they can create large volumes of
@@ -92,85 +175,144 @@ is_high_frequency_ssh_probe() {
     [ -z "$interval" ] || [ "$interval" -lt "$PROBE_MIN_INTERVAL" ]
 }
 
-# --- Module 1: Command Pre-execution Guard (exec) ---
+# --- Module 1: Command Pre-execution Guard ---
+POLICY_REASON=""
+POLICY_SUGGESTION=""
+
+classify_command() {
+    local target_cmd=$1
+    local python_traversal_re='python[0-9]*[[:space:]].*(-c|-[[:alnum:]]*c).*(os\.walk|\.rglob|glob\.glob)'
+    POLICY_REASON=""
+    POLICY_SUGGESTION=""
+
+    if is_high_frequency_ssh_probe "$target_cmd"; then
+        POLICY_REASON="High-frequency TCP/SSH liveness probing can create repeated pre-authentication reset logs and trigger IDS alerts."
+        POLICY_SUGGESTION="Reuse an existing SSH ControlMaster with 'hpcguard probe <ssh-host>', or use a scheduler/event-driven check."
+
+    elif [[ "$target_cmd" =~ (torchrun|accelerate[[:space:]]+launch|deepspeed|mpirun|horovodrun) ]]; then
+        POLICY_REASON="Distributed ML training framework detected on login node."
+        POLICY_SUGGESTION="Submit the workload through the site scheduler with an explicit GPU and CPU request."
+
+    elif [[ "$target_cmd" =~ python[0-9]*[[:space:]]+.*(train|finetune|pretrain|fit|wcr|embedding) ]]; then
+        POLICY_REASON="Python training or heavy-computation script detected outside a scheduler allocation."
+        POLICY_SUGGESTION="Submit the workload through the site scheduler with resources appropriate for the script."
+
+    elif [[ "$target_cmd" =~ (Rscript|R[[:space:]]+CMD|install\.packages|devtools::|BiocManager::|Seurat|DESeq2|RunPCA|RunUMAP) ]]; then
+        POLICY_REASON="Heavy R or bioinformatics work detected on a login node."
+        POLICY_SUGGESTION="Submit the workload through the site scheduler with an explicit CPU and memory request."
+
+    elif [[ "$target_cmd" =~ (bwa[[:space:]]+(mem|aln)|samtools[[:space:]]+(sort|index)|gatk[[:space:]]+|minimap2|bowtie2|deepvariant|snakemake[[:space:]]+-j|nextflow[[:space:]]+run) ]]; then
+        POLICY_REASON="Heavy genomics alignment or variant-calling work detected on a login node."
+        POLICY_SUGGESTION="Submit the workload through the site scheduler with an explicit CPU and memory request."
+
+    elif [[ "$target_cmd" =~ find[[:space:]]+(\/|\/gpfs|\/shared|\/home)[[:space:]] ]] || [[ "$target_cmd" =~ grep[[:space:]]+-r[a-zA-Z]*[[:space:]]+(\/|\/gpfs|\/shared) ]]; then
+        POLICY_REASON="A broad recursive scan on a root or shared filesystem was detected."
+        POLICY_SUGGESTION="Target a specific project directory or submit the scan as a scheduler job."
+
+    elif [[ "$target_cmd" =~ $python_traversal_re ]] && \
+         [[ "$target_cmd" =~ (\/gpfs|\/shared|\/home|['\"]\/['\"]) ]]; then
+        POLICY_REASON="Python code appears to recursively traverse a root or shared filesystem."
+        POLICY_SUGGESTION="Restrict traversal to a specific project directory or run it inside a scheduler allocation."
+
+    elif [[ "$target_cmd" =~ make[[:space:]]+-j[0-9]{2,} ]] || [[ "$target_cmd" =~ ninja[[:space:]]+-j[0-9]{2,} ]]; then
+        POLICY_REASON="A high-concurrency compilation was detected on a login node."
+        POLICY_SUGGESTION="Reduce build concurrency or submit the build through the site scheduler."
+    else
+        return 1
+    fi
+    return 0
+}
+
+render_block() {
+    local target_cmd=$1
+    echo -e "\n${RED}${BOLD}======================================================${NC}"
+    echo -e "${RED}${BOLD} [HPCGuard: BLOCKED ON LOGIN NODE]${NC}"
+    echo -e "${RED}${BOLD}======================================================${NC}"
+    echo -e "${YELLOW}Host:${NC}     $(hostname)"
+    echo -e "${YELLOW}Command:${NC}  $target_cmd"
+    echo -e "${YELLOW}Reason:${NC}   $POLICY_REASON"
+    echo -e "${GREEN}${BOLD}Suggested action:${NC}"
+    echo -e "  $POLICY_SUGGESTION\n"
+    echo -e "${BLUE}Hint: To generate a batch script, run: ${BOLD}hpcguard template${NC}\n"
+}
+
+join_argv() {
+    local joined="" argument quoted
+    for argument in "$@"; do
+        printf -v quoted '%q' "$argument"
+        joined+="${joined:+ }$quoted"
+    done
+    printf '%s\n' "$joined"
+}
+
+json_escape() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+check_command() {
+    [ "${1:-}" = --json ] && shift
+    [ "${1:-}" = -- ] && shift
+    if [ "$#" -eq 0 ]; then
+        echo 'Usage: hpcguard check -- <command> [args...]' >&2
+        return 2
+    fi
+    local target_cmd class decision reason suggestion status=0
+    target_cmd=$(join_argv "$@")
+    class=$(node_class)
+    decision=allow
+    reason="No blocking policy matched."
+    suggestion=""
+    if [ "$class" = login ] && classify_command "$target_cmd"; then
+        decision=block
+        reason=$POLICY_REASON
+        suggestion=$POLICY_SUGGESTION
+        status=101
+    elif [ "$class" = unknown ]; then
+        decision=unclassified
+        reason="Host is not recognized as a login node or scheduler allocation."
+        suggestion="Configure LOGIN_HOST_REGEX before relying on enforcement."
+    fi
+    printf '{"decision":"%s","node_class":"%s","reason":"%s","suggestion":"%s"}\n' \
+        "$decision" "$class" "$(json_escape "$reason")" "$(json_escape "$suggestion")"
+    return "$status"
+}
+
+run_command() {
+    [ "${1:-}" = -- ] && shift
+    if [ "$#" -eq 0 ]; then
+        echo 'Usage: hpcguard run -- <command> [args...]' >&2
+        return 2
+    fi
+    local target_cmd
+    target_cmd=$(join_argv "$@")
+    if is_login_node && classify_command "$target_cmd"; then
+        render_block "$target_cmd"
+        return 101
+    fi
+    command "$@"
+}
+
+# Compatibility interface for pipelines and compound shell syntax. Prefer
+# `hpcguard run -- command args...`, which preserves argv boundaries.
 cmd_exec_guard() {
     local target_cmd="$*"
     if [ -z "$target_cmd" ]; then
         echo -e "${RED}Error: No command specified.${NC}"
-        echo "Usage: hpcguard exec \"<command>\""
-        exit 1
+        echo "Usage: hpcguard exec \"<shell command>\""
+        return 2
     fi
 
-    # If already running inside a compute node allocation, allow directly
-    if ! is_login_node; then
-        eval "$target_cmd"
-        return $?
-    fi
-
-    # Check dangerous command patterns on login nodes
-    local blocked=false
-    local reason=""
-    local suggested_cmd=""
-
-    # 1. High-frequency TCP/SSH liveness loops
-    if is_high_frequency_ssh_probe "$target_cmd"; then
-        blocked=true
-        reason="High-frequency TCP/SSH liveness probing can create repeated pre-authentication reset logs and trigger IDS alerts."
-        suggested_cmd="Reuse an existing SSH ControlMaster with 'hpcguard probe <ssh-host>', or use a scheduler/event-driven check."
-
-    # 2. Distributed ML / Multi-GPU training (PyTorch, DeepSpeed, Horovod)
-    elif [[ "$target_cmd" =~ (torchrun|accelerate[[:space:]]+launch|deepspeed|mpirun|horovodrun) ]]; then
-        blocked=true
-        reason="Distributed ML training framework detected on login node."
-        suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 python <script.py> (or submit via 'sbatch your_job.slurm')"
-
-    # 3. Python ML / Deep Learning scripts
-    elif [[ "$target_cmd" =~ python[0-9]*[[:space:]]+.*(train|finetune|pretrain|fit|wcr|embedding) ]]; then
-        blocked=true
-        reason="Python training / heavy computation script detected outside Slurm allocation."
-        suggested_cmd="srun --partition=gpu --gres=gpu:1 --cpus-per-task=4 $target_cmd"
-
-    # 4. R Language & Statistical pipelines (Seurat, DESeq2, Rscript analysis, R package compilation)
-    elif [[ "$target_cmd" =~ (Rscript|R[[:space:]]+CMD|install\.packages|devtools::|BiocManager::|Seurat|DESeq2|RunPCA|RunUMAP) ]]; then
-        blocked=true
-        reason="Heavy R/Bioinformatics pipeline or native package compilation detected on login node."
-        suggested_cmd="srun --partition=cpu --cpus-per-task=8 --mem=32G $target_cmd (or submit via 'sbatch r_job.slurm')"
-
-    # 5. Genomics & Alignment heavy CLI tools (bwa, samtools sort/index, gatk, minimap2, bowtie2, deepvariant, snakemake, nextflow)
-    elif [[ "$target_cmd" =~ (bwa[[:space:]]+(mem|aln)|samtools[[:space:]]+(sort|index)|gatk[[:space:]]+|minimap2|bowtie2|deepvariant|snakemake[[:space:]]+-j|nextflow[[:space:]]+run) ]]; then
-        blocked=true
-        reason="Heavy genomics alignment / variant calling pipeline detected on login node."
-        suggested_cmd="srun --partition=cpu --cpus-per-task=8 --mem=32G $target_cmd (or submit via 'sbatch genomics_job.slurm')"
-
-    # 6. Large-scale recursive disk scanning on shared network filesystems (GPFS, Lustre, NFS)
-    elif [[ "$target_cmd" =~ find[[:space:]]+(\/|\/gpfs|\/shared|\/home)[[:space:]] ]] || [[ "$target_cmd" =~ grep[[:space:]]+-r[a-zA-Z]*[[:space:]]+(\/|\/gpfs|\/shared) ]]; then
-        blocked=true
-        reason="Recursive scan on shared/root filesystem detected (may trigger D-state metadata I/O stall)."
-        suggested_cmd="Target specific project subdirectories or submit as a lightweight background Slurm batch."
-
-    # 7. High-concurrency builds (make / ninja)
-    elif [[ "$target_cmd" =~ make[[:space:]]+-j[0-9]{2,} ]] || [[ "$target_cmd" =~ ninja[[:space:]]+-j[0-9]{2,} ]]; then
-        blocked=true
-        reason="High-concurrency compilation detected (overloaded thread count on shared CPU)."
-        suggested_cmd="Use 'make -j4' or submit compilation to a CPU compute node via srun."
-    fi
-
-    if [ "$blocked" = true ]; then
-        echo -e "\n${RED}${BOLD}======================================================${NC}"
-        echo -e "${RED}${BOLD} [HPCGuard: BLOCKED ON LOGIN NODE]${NC}"
-        echo -e "${RED}${BOLD}======================================================${NC}"
-        echo -e "${YELLOW}Host:${NC}     $(hostname)"
-        echo -e "${YELLOW}Command:${NC}  $target_cmd"
-        echo -e "${YELLOW}Reason:${NC}   $reason"
-        echo -e "${GREEN}${BOLD}Suggested Execution:${NC}"
-        echo -e "  $suggested_cmd\n"
-        echo -e "${BLUE}💡 Hint: To generate a batch script, run: ${BOLD}hpcguard template${NC}\n"
+    if is_login_node && classify_command "$target_cmd"; then
+        render_block "$target_cmd"
         return 101
-    else
-        # Allow safe command to proceed
-        eval "$target_cmd"
-        return $?
     fi
+    bash -c "$target_cmd"
 }
 
 # Check only an already-running OpenSSH multiplexing master. This function has
@@ -213,80 +355,167 @@ probe_existing_master() {
     return 4
 }
 
-# --- Module 2: Resource Watchdog, Dilution Guard & Auto-Kill ---
+# --- Module 2: Resource Watchdog, Dilution Guard & Opt-in Termination ---
+watchdog_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    IFS=$'\t' read -r pid _ < "$PID_FILE" || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+watchdog_process_matches() {
+    local pid=$1 arguments recorded_start current_start
+    kill -0 "$pid" 2>/dev/null || return 1
+    IFS=$'\t' read -r _ recorded_start < "$PID_FILE" || return 1
+    arguments=$(ps -ww -p "$pid" -o args= 2>/dev/null || true)
+    current_start=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -n "$recorded_start" ] && [ "$current_start" = "$recorded_start" ] &&
+        [[ "$arguments" == *"hpc_guard.sh __watchdog"* ]]
+}
+
+watchdog_is_running() {
+    local pid
+    pid=$(watchdog_pid) || return 1
+    watchdog_process_matches "$pid"
+}
+
+protected_process_name() {
+    case "$1" in
+        bash|zsh|sh|fish|ssh|sshd|srun|sbatch|salloc|scancel|tmux|screen|hpc_guard.sh) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+terminate_verified_process() {
+    local pid=$1 expected_name=$2 expected_start=$3
+    local current_uid current_name current_start attempt
+    current_uid=$(ps -p "$pid" -o uid= 2>/dev/null | awk '{print $1}')
+    current_name=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{print $1}')
+    current_start=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    [ "$current_uid" = "$(id -u)" ] || return 1
+    [ "$current_name" = "$expected_name" ] || return 1
+    [ "$current_start" = "$expected_start" ] || return 1
+    protected_process_name "$current_name" && return 1
+
+    kill -TERM "$pid" 2>/dev/null || return 1
+    for attempt in 1 2 3; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 1
+    done
+
+    current_start=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ "$current_start" = "$expected_start" ] || return 1
+    kill -KILL "$pid" 2>/dev/null
+}
+
+watchdog_loop() {
+    trap 'exit 0' TERM INT HUP
+    local pid cpu name started total_cpu d_pids lsp_pids
+    while true; do
+        while read -r pid cpu name; do
+            [ -n "$pid" ] || continue
+            if awk -v value="$cpu" -v limit="$CPU_SINGLE_LIMIT" 'BEGIN {exit !(value >= limit)}'; then
+                log "[SINGLE PROCESS OVERLOAD] Process $name (PID $pid) exceeded $CPU_SINGLE_LIMIT% CPU on a login node."
+                if [ "$AUTO_KILL" = true ]; then
+                    started=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    if [ -n "$started" ] && terminate_verified_process "$pid" "$name" "$started"; then
+                        log "[AUTO-TERMINATE] Stopped verified process $pid ($name)."
+                    else
+                        log "[AUTO-TERMINATE SKIPPED] Process identity changed or process is protected: $pid ($name)."
+                    fi
+                fi
+            fi
+        done < <(ps -u "$(id -un)" -o pid=,pcpu=,comm= 2>/dev/null || true)
+
+        total_cpu=$(ps -u "$(id -un)" -o pcpu= 2>/dev/null | awk '{sum += $1} END {print int(sum)}')
+        if [ -n "$total_cpu" ] && [ "$total_cpu" -ge "$CPU_AGGREGATE_LIMIT" ]; then
+            log "[AGGREGATE OVERLOAD] Account CPU reached $total_cpu% (limit: $CPU_AGGREGATE_LIMIT%)."
+        fi
+
+        d_pids=$(ps -u "$(id -un)" -o pid=,stat= 2>/dev/null | awk '$2 ~ /^D/ {print $1}' | paste -sd, -)
+        if [ -n "$d_pids" ]; then
+            log "[D-STATE OBSERVED] Process IDs $d_pids are in uninterruptible sleep; inspect storage and kernel evidence before attribution."
+        fi
+
+        lsp_pids=$(ps -u "$(id -un)" -o pid=,pcpu=,comm= 2>/dev/null | awk '$3 ~ /^(node|pylance|rsession)$/ && $2 >= 60 {print $1}' | paste -sd, -)
+        if [ -n "$lsp_pids" ]; then
+            log "[IDE INDEXING LOAD] High-CPU language-server process IDs: $lsp_pids."
+        fi
+
+        sleep "$CHECK_INTERVAL"
+    done
+}
+
 start_watchdog() {
     if ! is_login_node; then
         echo -e "${YELLOW}Watchdog not started: this host is not configured as a login node.${NC}"
         return 1
     fi
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "${YELLOW}Watchdog daemon is already running (PID: $(cat "$PID_FILE")).${NC}"
+    if watchdog_is_running; then
+        echo -e "${YELLOW}Watchdog daemon is already running (PID: $(watchdog_pid)).${NC}"
+        return 0
+    fi
+    if ! mkdir "$START_LOCK_DIR" 2>/dev/null; then
+        echo -e "${YELLOW}Another watchdog start operation is in progress.${NC}"
+        return 1
+    fi
+    if watchdog_is_running; then
+        rmdir "$START_LOCK_DIR" 2>/dev/null || true
         return 0
     fi
 
+    local script_path pid started temporary
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     echo -e "${GREEN}Starting HPCGuard Watchdog daemon in background...${NC}"
-    nohup bash -c "
-    while true; do
-        # 1. Single Process CPU Threshold Check
-        high_pids=\$(ps -u \$(whoami) -o pid,pcpu,comm --no-headers 2>/dev/null | awk '\$2 >= $CPU_SINGLE_LIMIT {print \$1}')
-        if [ -n \"\$high_pids\" ]; then
-            for pid in \$high_pids; do
-                pname=\$(ps -p \$pid -o comm= 2>/dev/null || echo 'unknown')
-                echo \"[\$(date)] [SINGLE PROCESS OVERLOAD] Process \$pname (PID \$pid) exceeded $CPU_SINGLE_LIMIT% CPU on login node.\" >> '$LOG_FILE'
-                if [ '$AUTO_KILL' = 'true' ]; then
-                    kill -9 \$pid 2>/dev/null && echo \"[\$(date)] [AUTO-KILL] Terminated runaway process \$pid (\$pname).\" >> '$LOG_FILE'
-                fi
-            done
-        fi
-
-        # 2. Multi-Process Aggregate CPU Dilution Check
-        total_cpu=\$(ps -u \$(whoami) -o pcpu --no-headers 2>/dev/null | awk '{s+=\$1} END {print int(s)}')
-        if [ -n \"\$total_cpu\" ] && [ \"\$total_cpu\" -ge $CPU_AGGREGATE_LIMIT ]; then
-            echo \"[\$(date)] [AGGREGATE OVERLOAD] User total CPU reached \$total_cpu% (Limit: $CPU_AGGREGATE_LIMIT%).\" >> '$LOG_FILE'
-        fi
-
-        # 3. D-State (Uninterruptible Storage I/O) Lock Check
-        d_pids=\$(ps -u \$(whoami) -o pid,stat,comm --no-headers 2>/dev/null | awk '\$2 ~ /^D/ {print \$1}')
-        if [ -n \"\$d_pids\" ]; then
-            echo \"[\$(date)] [STORAGE I/O D-STATE DETECTED] Process(es) \$d_pids waiting on parallel filesystem metadata locks.\" >> '$LOG_FILE'
-        fi
-
-        # 4. IDE / Language Server Background Indexing Check (e.g. Node Pylance / Rsession)
-        lsp_pids=\$(ps -u \$(whoami) -o pid,pcpu,comm --no-headers 2>/dev/null | grep -E 'node|pylance|rsession' | awk '\$2 >= 60 {print \$1}')
-        if [ -n \"\$lsp_pids\" ]; then
-            echo \"[\$(date)] [IDE LANGUAGE SERVER OVERLOAD] Detected high CPU indexing on login node (PIDs: \$lsp_pids). Run 'hpcguard init-vscode' to optimize.\" >> '$LOG_FILE'
-        fi
-
-        sleep $CHECK_INTERVAL
-    done
-    " >/dev/null 2>&1 &
-
-    echo $! > "$PID_FILE"
-    echo -e "${GREEN}✅ Watchdog daemon started successfully (PID: $!).${NC}"
+    nohup bash "$script_path" __watchdog >/dev/null 2>&1 &
+    pid=$!
+    started=$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    temporary=$(mktemp "$CONFIG_DIR/watchdog.pid.tmp.XXXXXX") || {
+        kill "$pid" 2>/dev/null || true
+        rmdir "$START_LOCK_DIR" 2>/dev/null || true
+        return 1
+    }
+    printf '%s\t%s\n' "$pid" "$started" > "$temporary"
+    mv -f "$temporary" "$PID_FILE"
+    rmdir "$START_LOCK_DIR" 2>/dev/null || true
+    echo -e "${GREEN}Watchdog daemon started successfully (PID: $pid).${NC}"
 }
 
 stop_watchdog() {
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    local pid attempt
+    if ! watchdog_is_running; then
+        echo -e "${YELLOW}Watchdog is not running; stale state was removed.${NC}"
         rm -f "$PID_FILE"
-        echo -e "${GREEN}✅ Watchdog stopped.${NC}"
-    else
-        echo -e "${YELLOW}Watchdog is not running.${NC}"
-        rm -f "$PID_FILE"
+        return 0
     fi
+    pid=$(watchdog_pid)
+    kill -TERM "$pid" 2>/dev/null || true
+    for attempt in 1 2 3; do
+        watchdog_process_matches "$pid" || break
+        sleep 1
+    done
+    if watchdog_process_matches "$pid"; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    echo -e "${GREEN}Watchdog stopped.${NC}"
 }
 
 status_watchdog() {
     echo -e "\n${BOLD}=== HPCGuard System Status ===${NC}"
     echo -e "Hostname:         ${BLUE}$(hostname)${NC}"
-    if is_login_node; then
-        echo -e "Node Type:        ${YELLOW}Login / Head Node (Guarded)${NC}"
-    else
-        echo -e "Node Type:        ${GREEN}Compute Node / Inside Slurm Allocation${NC}"
-    fi
+    local class
+    class=$(node_class)
+    case "$class" in
+        login) echo -e "Node Type:        ${YELLOW}Login / Head Node (Guarded)${NC}" ;;
+        allocation) echo -e "Node Type:        ${GREEN}Inside Scheduler Allocation${NC}" ;;
+        *) echo -e "Node Type:        ${YELLOW}Unknown / Unclassified (Not Guarded)${NC}" ;;
+    esac
 
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo -e "Watchdog:         ${GREEN}Running (PID: $(cat "$PID_FILE"))${NC}"
+    if watchdog_is_running; then
+        echo -e "Watchdog:         ${GREEN}Running (PID: $(watchdog_pid))${NC}"
     else
         echo -e "Watchdog:         ${RED}Stopped${NC}"
     fi
@@ -297,6 +526,23 @@ status_watchdog() {
 }
 
 # --- Module 3: Multi-Language Slurm Batch Generator (with Array Rate Limiter) ---
+valid_slurm_name() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]
+}
+
+valid_memory_value() {
+    [[ "$1" =~ ^[1-9][0-9]*([KMGTP]([iI]?[bB])?)?$ ]]
+}
+
+valid_time_value() {
+    [[ "$1" =~ ^([0-9]+-)?[0-9]{1,2}:[0-9]{2}:[0-9]{2}$ ]]
+}
+
+invalid_template_value() {
+    echo -e "${RED}Error: invalid $1 value.${NC}" >&2
+    return 2
+}
+
 generate_slurm_template() {
     echo -e "\n${BOLD}--- Interactive Slurm Job Generator ---${NC}"
     echo -e "Select workload type:"
@@ -305,40 +551,53 @@ generate_slurm_template() {
     echo -e " [3] Genomics Alignment / Variant Calling (CPU)"
     read -r -p "Select [1-3, default: 1]: " work_type
     work_type=${work_type:-1}
+    [[ "$work_type" =~ ^[123]$ ]] || { invalid_template_value "workload type"; return $?; }
 
     read -r -p "Job Name [my_job]: " job_name
     job_name=${job_name:-my_job}
+    valid_slurm_name "$job_name" || { invalid_template_value "job name"; return $?; }
 
     read -r -p "Enable Slurm Array Job? [y/N]: " is_array
     is_array=${is_array:-N}
+    [[ "$is_array" =~ ^[YyNn]$ ]] || { invalid_template_value "array choice"; return $?; }
 
     local array_directive=""
     if [[ "$is_array" =~ ^[Yy]$ ]]; then
         read -r -p "Array Range [1-50]: " array_range
         array_range=${array_range:-1-50}
+        [[ "$array_range" =~ ^[0-9]+(-[0-9]+)?(:[1-9][0-9]*)?$ ]] || { invalid_template_value "array range"; return $?; }
 
         read -r -p "Max Concurrent Subtasks [%10]: " array_concurrency
         array_concurrency=${array_concurrency:-10}
         array_concurrency=${array_concurrency#%} # Strip % if user typed it
+        valid_integer "$array_concurrency" 1 100000 || { invalid_template_value "array concurrency"; return $?; }
 
         array_directive="#SBATCH --array=${array_range}%${array_concurrency}"
         echo -e "${BLUE}💡 Array rate-limiting enabled: max ${array_concurrency} tasks running simultaneously.${NC}"
     fi
 
     local filename="${job_name}.slurm"
+    if [ -e "$filename" ] || [ -L "$filename" ]; then
+        echo -e "${YELLOW}Refusing to overwrite existing path: $filename${NC}" >&2
+        return 3
+    fi
 
     if [ "$work_type" = "2" ]; then
         read -r -p "Partition [cpu]: " partition
         partition=${partition:-cpu}
+        valid_slurm_name "$partition" || { invalid_template_value "partition"; return $?; }
 
         read -r -p "CPUs per task [8]: " cpus
         cpus=${cpus:-8}
+        valid_integer "$cpus" 1 4096 || { invalid_template_value "CPU count"; return $?; }
 
         read -r -p "Memory [32G]: " mem
         mem=${mem:-32G}
+        valid_memory_value "$mem" || { invalid_template_value "memory"; return $?; }
 
         read -r -p "Time limit [08:00:00]: " time_limit
         time_limit=${time_limit:-08:00:00}
+        valid_time_value "$time_limit" || { invalid_template_value "time limit"; return $?; }
 
         read -r -p "R Script to run [Rscript main.R]: " r_cmd
         r_cmd=${r_cmd:-Rscript main.R}
@@ -367,15 +626,19 @@ EOF
     elif [ "$work_type" = "3" ]; then
         read -r -p "Partition [cpu]: " partition
         partition=${partition:-cpu}
+        valid_slurm_name "$partition" || { invalid_template_value "partition"; return $?; }
 
         read -r -p "CPUs per task [16]: " cpus
         cpus=${cpus:-16}
+        valid_integer "$cpus" 1 4096 || { invalid_template_value "CPU count"; return $?; }
 
         read -r -p "Memory [64G]: " mem
         mem=${mem:-64G}
+        valid_memory_value "$mem" || { invalid_template_value "memory"; return $?; }
 
         read -r -p "Time limit [12:00:00]: " time_limit
         time_limit=${time_limit:-12:00:00}
+        valid_time_value "$time_limit" || { invalid_template_value "time limit"; return $?; }
 
         read -r -p "Command to run [bwa mem -t 16 ref.fa read1.fq read2.fq]: " gen_cmd
         gen_cmd=${gen_cmd:-bwa mem -t 16 ref.fa read1.fq read2.fq}
@@ -403,18 +666,23 @@ EOF
     else
         read -r -p "Partition [gpu]: " partition
         partition=${partition:-gpu}
+        valid_slurm_name "$partition" || { invalid_template_value "partition"; return $?; }
 
         read -r -p "GPU Count [1]: " gpus
         gpus=${gpus:-1}
+        valid_integer "$gpus" 1 128 || { invalid_template_value "GPU count"; return $?; }
 
         read -r -p "CPUs per task [4]: " cpus
         cpus=${cpus:-4}
+        valid_integer "$cpus" 1 4096 || { invalid_template_value "CPU count"; return $?; }
 
         read -r -p "Memory [32G]: " mem
         mem=${mem:-32G}
+        valid_memory_value "$mem" || { invalid_template_value "memory"; return $?; }
 
         read -r -p "Time limit [12:00:00]: " time_limit
         time_limit=${time_limit:-12:00:00}
+        valid_time_value "$time_limit" || { invalid_template_value "time limit"; return $?; }
 
         read -r -p "Python Command [python main.py]: " py_cmd
         py_cmd=${py_cmd:-python main.py}
@@ -449,11 +717,11 @@ EOF
 
 # --- Module 4: Job Diagnostics & Failure Inspector (inspect) ---
 inspect_job() {
-    local job_id="$1"
-    if [ -z "$job_id" ]; then
+    local job_id="${1:-}"
+    if [ -z "$job_id" ] || [[ ! "$job_id" =~ ^[0-9]+(_[0-9]+)?$ ]]; then
         echo -e "${RED}Error: No Job ID specified.${NC}"
-        echo "Usage: hpcguard inspect <job_id>"
-        return 1
+        echo "Usage: hpcguard inspect <numeric_job_id>" >&2
+        return 2
     fi
 
     echo -e "\n${BLUE}${BOLD}======================================================${NC}"
@@ -462,23 +730,22 @@ inspect_job() {
 
     if command -v sacct >/dev/null 2>&1; then
         echo -e "${YELLOW}Accounting Summary (sacct):${NC}"
-        sacct -j "$job_id" --format=JobID,JobName%20,Partition,State,ExitCode,MaxRSS,Elapsed,NodeList
+        sacct --jobs="$job_id" --format=JobID,JobName%20,Partition,State,ExitCode,MaxRSS,Elapsed,NodeList
         echo ""
     else
         echo -e "${YELLOW}Notice: 'sacct' command not found on current host.${NC}\n"
     fi
 
     # Attempt to locate log files in current directory
-    local candidate_logs
-    candidate_logs=$(find . -maxdepth 2 -name "*${job_id}*.log" 2>/dev/null || true)
-    if [ -n "$candidate_logs" ]; then
-        for log_path in $candidate_logs; do
-            echo -e "${GREEN}Found Job Log: ${BOLD}$log_path${NC}"
-            echo -e "${YELLOW}--- Tail (Last 15 lines) ---${NC}"
-            tail -n 15 "$log_path"
-            echo -e "${YELLOW}----------------------------${NC}\n"
-        done
-    fi
+    local log_path found=false
+    while IFS= read -r -d '' log_path; do
+        found=true
+        echo -e "${GREEN}Found Job Log: ${BOLD}$log_path${NC}"
+        echo -e "${YELLOW}--- Tail (Last 15 lines; terminal escapes removed) ---${NC}"
+        tail -n 15 "$log_path" | LC_ALL=C sed $'s/\033\[[0-9;?]*[ -\/]*[@-~]//g'
+        echo -e "${YELLOW}----------------------------${NC}\n"
+    done < <(find . -maxdepth 2 -type f -name "*${job_id}*.log" -print0 2>/dev/null)
+    [ "$found" = true ] || echo -e "${YELLOW}No matching job log found within two directory levels.${NC}\n"
 }
 
 # --- Module 5: VSCode Remote Anti-Stall Config Generator ---
@@ -486,8 +753,35 @@ init_vscode_settings() {
     local target_dir="${1:-.}"
     local vscode_dir="$target_dir/.vscode"
     local settings_file="$vscode_dir/settings.json"
+    local force=false backup_file=""
+
+    if [ "$target_dir" = --force ]; then
+        force=true
+        target_dir=.
+        vscode_dir="$target_dir/.vscode"
+        settings_file="$vscode_dir/settings.json"
+    elif [ "${2:-}" = --force ]; then
+        force=true
+    fi
 
     mkdir -p "$vscode_dir"
+
+    if [ -L "$settings_file" ]; then
+        echo -e "${RED}Refusing to replace symlinked settings file: $settings_file${NC}" >&2
+        return 3
+    fi
+    if [ -e "$settings_file" ] && [ "$force" != true ]; then
+        settings_file="$vscode_dir/settings.hpcguard.json"
+        if [ -e "$settings_file" ] || [ -L "$settings_file" ]; then
+            echo -e "${YELLOW}Existing VSCode settings were preserved; proposed settings already exist at $settings_file.${NC}" >&2
+            return 3
+        fi
+        echo -e "${YELLOW}Existing settings.json will not be overwritten. Writing a reviewable proposal instead.${NC}"
+    elif [ -e "$settings_file" ]; then
+        backup_file=$(mktemp "$vscode_dir/settings.json.backup.XXXXXX") || return 1
+        cp -p "$settings_file" "$backup_file"
+        echo -e "${YELLOW}Existing settings backed up to $backup_file.${NC}"
+    fi
 
     cat <<EOF > "$settings_file"
 {
@@ -520,7 +814,7 @@ init_vscode_settings() {
 EOF
 
     echo -e "\n${GREEN}✅ Generated safe VSCode Remote settings: ${BOLD}$settings_file${NC}"
-    echo -e "This disables recursive symlinks, excludes massive datasets from file watchers, and limits Pylance indexing.\n"
+    echo -e "Review and merge these settings as appropriate for the project.\n"
 }
 
 # --- Module 6: Global Alias Helper ---
@@ -580,9 +874,7 @@ show_menu() {
             else
                 AUTO_KILL=true
             fi
-            echo "AUTO_KILL=$AUTO_KILL" > "$CONFIG_FILE"
-            echo "CPU_SINGLE_LIMIT=$CPU_SINGLE_LIMIT" >> "$CONFIG_FILE"
-            echo "CPU_AGGREGATE_LIMIT=$CPU_AGGREGATE_LIMIT" >> "$CONFIG_FILE"
+            save_config
             echo -e "${GREEN}Auto-Kill set to: $AUTO_KILL${NC}"
             ;;
         5)
@@ -605,6 +897,14 @@ show_menu() {
 # --- CLI Parameter Router ---
 main() {
 case "${1:-}" in
+    check)
+        shift
+        check_command "$@"
+        ;;
+    run)
+        shift
+        run_command "$@"
+        ;;
     exec)
         shift
         cmd_exec_guard "$@"
@@ -635,6 +935,9 @@ case "${1:-}" in
         ;;
     install-alias)
         install_alias
+        ;;
+    __watchdog)
+        watchdog_loop
         ;;
     *)
         show_menu

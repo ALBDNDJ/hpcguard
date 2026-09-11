@@ -7,10 +7,15 @@ When executing terminal commands in this repository or on this HPC cluster, auto
 - Compute-intensive jobs, multi-GPU scripts, deep learning model training, heavy R/Bioinformatics pipelines (Seurat, DESeq2), genomics alignment/variant calling tools (`bwa`, `samtools`, `gatk`), and root-level disk traversals are STRICTLY PROHIBITED on login nodes.
 
 ## 2. Command Interception
-- For any command that involves Python ML training, R analysis pipelines (`Rscript`), genomics binaries (`bwa`, `samtools`, `gatk`, `deepvariant`), native package compilation, or deep file traversal, wrap the execution with `hpcguard exec`:
+- For any command that involves Python ML training, R analysis pipelines (`Rscript`), genomics binaries (`bwa`, `samtools`, `gatk`, `deepvariant`), native package compilation, or deep file traversal, route the execution through HPCGuard. Prefer the argv-preserving form:
+  ```bash
+  hpcguard run -- <command> [args...]
+  ```
+  Use the shell-string form only when compound shell syntax is required:
   ```bash
   hpcguard exec "<command>"
   ```
+- For integrations that need a decision without execution, use `hpcguard check --json -- <command> [args...]`.
 - If HPCGuard blocks the command with `[HPCGuard: BLOCKED ON LOGIN NODE]`, do NOT attempt to bypass or retry directly. Instead:
   1. Parse the suggested Slurm command (`srun` / `sbatch`).
   2. Write a standard `.slurm` batch submission script.
@@ -32,3 +37,5 @@ The following lightweight operations are safe to run directly on the login node:
 ## 6. SSH Liveness Checks
 - Never create a short-interval loop around `nc -z`, `/dev/tcp`, or a fresh `ssh` connection. Repeated pre-authentication resets may trigger institutional IDS alerts.
 - To check connectivity, reuse a manually established OpenSSH ControlMaster with `hpcguard probe <ssh-config-host>`. If no live control socket exists, stop and leave authentication to the user.
+
+HPCGuard is a cooperative user-space guard: commands that bypass these wrappers are outside its pre-execution enforcement boundary. It does not replace scheduler, cgroup, network, or administrator controls.

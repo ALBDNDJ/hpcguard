@@ -24,13 +24,17 @@ However, autonomous AI coding agents and automated scientific workflows frequent
 
 **This results in cluster login node freezes, account suspensions, and complaints from peers.**
 
-`HPCGuard` acts as an autonomous safety runtime:
-1. **Pre-execution Interception (`hpcguard exec`)**: Inspects shell commands before execution. Blocks matched workloads on login nodes and suggests a compliant `srun` / `sbatch` alternative.
+`HPCGuard` acts as an account-scoped safety runtime when commands are routed through it:
+1. **Pre-execution Interception (`hpcguard exec` / `hpcguard run`)**: Inspects wrapped commands before execution. Blocks matched workloads on login nodes and suggests a compliant scheduler alternative.
 2. **Job Failure Inspector & Diagnostics (`hpcguard inspect <id>`)**: Automatically inspects Slurm accounting states, exit codes, and tails job logs to identify reasons for failure (OOM, timeouts, syntax errors).
-3. **Multi-Vector Watchdog & Breaker**: Silently monitors single-process CPU, aggregate multi-process dilution, and storage D-state I/O locks.
+3. **Multi-Vector Watchdog**: Observes single-process CPU, aggregate multi-process load, and storage D-state signals. Automatic termination is opt-in and verifies process identity before acting.
 4. **Slurm Job Assistant (with Array Rate Limiting)**: Interactively generates production-ready Slurm batch scripts for **Python ML**, **R / Bioinformatics**, and **Genomics Pipelines** with automatic `%` concurrency rate-limiting.
 5. **IDE Workspace Anti-Stall Helper (`hpcguard init-vscode`)**: Automatically configures safe `.vscode/settings.json` to eliminate recursive file watchers and background language server metadata storms.
 6. **ControlMaster-only SSH Probe (`hpcguard probe`)**: Checks an already-running multiplexed SSH connection through its local Unix socket, with no TCP or authentication fallback.
+
+### Security boundaries
+
+HPCGuard is a user-space, cooperative guard. It can only inspect commands that an agent or shell routes through `hpcguard exec`, `hpcguard check`, or `hpcguard run`; it cannot intercept arbitrary unwrapped processes without administrator or kernel support. Unknown hostnames are reported as **unclassified** rather than silently treated as compute nodes. HPCGuard does not replace cgroups, Slurm policy, network controls, or administrator configuration.
 
 ---
 
@@ -39,7 +43,7 @@ However, autonomous AI coding agents and automated scientific workflows frequent
 No root permissions or administrator cooperation required. Simply run on your cluster login node:
 
 ```bash
-wget -O hpc_guard.sh https://raw.githubusercontent.com/ALBDNDJ/hpcguard/main/hpc_guard.sh && chmod +x hpc_guard.sh && ./hpc_guard.sh
+wget -O hpc_guard.sh https://raw.githubusercontent.com/ALBDNDJ/hpcguard/v1.5.0/hpc_guard.sh && chmod +x hpc_guard.sh && ./hpc_guard.sh
 ```
 
 ### Enable Global Shortcut
@@ -118,11 +122,22 @@ hpcguard exec "bwa mem -t 16 ref.fa read1.fq read2.fq"
 Host:     login01
 Command:  bwa mem -t 16 ref.fa read1.fq read2.fq
 Reason:   Heavy genomics alignment / variant calling pipeline detected on login node.
-Suggested Execution:
-  srun --partition=cpu --cpus-per-task=8 --mem=32G bwa mem -t 16 ref.fa read1.fq read2.fq (or submit via 'sbatch genomics_job.slurm')
+Suggested action:
+  Submit the workload through the site scheduler with an explicit CPU and memory request.
 
 💡 Hint: To generate a batch script, run: hpcguard template
 ```
+
+For integrations that already have an argument vector, prefer the boundary-preserving form:
+
+```bash
+hpcguard check -- torchrun --nproc_per_node=4 train_model.py
+hpcguard check --json -- python analysis.py --input "sample with spaces"
+hpcguard run -- python analysis.py --input "sample with spaces"
+```
+
+`check` returns a machine-readable decision without executing the command.
+The legacy `exec "..."` form remains available for compound shell syntax, but it necessarily interprets a shell command string.
 
 ### 2. Slurm Job Diagnostics (`hpcguard inspect <id>`)
 Inspect why a batch job failed or check running status:
@@ -137,7 +152,7 @@ hpcguard template
 ```
 
 ### 4. VSCode Remote Anti-Stall Setup (`hpcguard init-vscode`)
-Instantly inject optimized `.vscode/settings.json` into your current directory to stop background file watchers from scanning large datasets:
+Generate reviewable `.vscode` settings to stop background file watchers from scanning large datasets. Existing settings are preserved by default:
 ```bash
 hpcguard init-vscode
 ```
@@ -168,7 +183,7 @@ Add the following instructions to your project's `CLAUDE.md` or `AGENTS.md`:
 
 ```markdown
 ### HPC Cluster Execution Rules
-- Always prepend long-running, training, Rscript, or scanning commands with `hpcguard exec "<cmd>"`.
+- Route long-running, training, Rscript, or scanning commands through `hpcguard run -- ...` when an argument vector is available; use `hpcguard exec "<cmd>"` only when compound shell syntax is required.
 - Never start multi-GPU, PyTorch training, or heavy R/Bioinformatics/Genomics processes directly on login nodes.
 - When opening large dataset workspaces, run `hpcguard init-vscode` to prevent language server indexing storms.
 - When submitting array jobs, always include concurrency limits (e.g., `--array=1-100%10`).
@@ -183,6 +198,8 @@ Add the following instructions to your project's `CLAUDE.md` or `AGENTS.md`:
 | Command | Description |
 | :--- | :--- |
 | `hpcguard` | Open interactive TUI management menu |
+| `hpcguard check -- <command> [args...]` | Return a JSON policy decision without executing |
+| `hpcguard run -- <command> [args...]` | Check and execute while preserving argument boundaries |
 | `hpcguard exec "<command>"` | Intercept and guard a specific shell command |
 | `hpcguard inspect <job_id>` | Inspect Slurm job accounting, exit code, and log tail |
 | `hpcguard probe <ssh-host>` | Check an existing ControlMaster socket without a network fallback |
