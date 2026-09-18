@@ -8,6 +8,9 @@ cgroups, scheduler limits, or access controls.
 
 The current supported version is the latest tagged release.
 
+The project's assets, actors, trust boundaries, controls, and known residual
+risks are documented in [THREAT_MODEL.md](THREAT_MODEL.md).
+
 ## Reporting a vulnerability
 
 Do **not** publish real cluster details in a public issue. In particular, do

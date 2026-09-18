@@ -5,6 +5,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/ALBDNDJ/hpcguard/actions/workflows/ci.yml/badge.svg)](https://github.com/ALBDNDJ/hpcguard/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/ALBDNDJ/hpcguard?style=flat)](https://github.com/ALBDNDJ/hpcguard/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/ALBDNDJ/hpcguard?style=flat)](https://github.com/ALBDNDJ/hpcguard/forks)
 [![Slurm Ready](https://img.shields.io/badge/Scheduler-Slurm-orange.svg)](#)
 [![Python, R, Genomics](https://img.shields.io/badge/Workloads-Python%20%7C%20R%20%7C%20Genomics-brightgreen.svg)](#)
 [![Zero Root Required](https://img.shields.io/badge/Root-Not_Required-green.svg)](#)
@@ -38,6 +40,39 @@ However, autonomous AI coding agents and automated scientific workflows frequent
 HPCGuard is a user-space, cooperative guard. It can only inspect commands that an agent or shell routes through `hpcguard exec`, `hpcguard check`, or `hpcguard run`; it cannot intercept arbitrary unwrapped processes without administrator or kernel support. Unknown hostnames fail closed as **unclassified** rather than being treated as compute nodes. HPCGuard does not replace cgroups, Slurm policy, network controls, or administrator configuration.
 
 The current implementation and operational experience are scoped to one shared **Slurm** environment. Other schedulers and cluster policies have not been validated, so the project does not claim cross-cluster compatibility yet.
+
+---
+
+## Project Status & Validation
+
+HPCGuard is maintainer-operated on one shared Slurm cluster and has been used there for more than one month. Community interest is shown separately through the live GitHub star and fork badges above; those numbers are not presented as verified installations or active users.
+
+The project currently has 73 regression assertions, with syntax checks, ShellCheck, and the regression suite running in GitHub Actions. Compatibility claims are intentionally limited to evidence that has actually been collected:
+
+| Area | Validation status |
+| :--- | :--- |
+| Scheduler | Slurm on one maintainer-operated shared cluster |
+| Runtime | Bash on the maintainer's Linux cluster; CI also runs on GitHub-hosted Ubuntu |
+| AI agents | Portable `check` / `run` command contract; no product-specific host-level hook |
+| Shared storage | Incident-derived protections for broad traversal and metadata pressure; no cross-site filesystem certification |
+| PBS / LSF / other schedulers | Not tested or supported |
+
+Anonymized compatibility and false-positive reports are welcome. Do not include real cluster names, IP addresses, usernames, paths, job IDs, credentials, or unredacted logs.
+
+### Architecture and enforcement boundary
+
+```mermaid
+flowchart LR
+    A[AI agent or researcher] --> B{HPCGuard entry point}
+    B -->|check| C[Machine-readable policy decision]
+    B -->|run / exec| D[Login-node policy layer]
+    D --> E[Retry and submission circuit breakers]
+    E --> F[Slurm / SSH / filesystem command]
+    W[Account watchdog] -. observes current-user CPU, RSS, process and D-state signals .-> F
+    A -. unwrapped command: outside enforcement .-> F
+```
+
+HPCGuard is therefore a cooperative account-level control, not a transparent system-wide sandbox. See the [threat model](THREAT_MODEL.md) for assets, assumptions, controls, and residual risks.
 
 ---
 
@@ -240,3 +275,5 @@ Machine-oriented exit statuses: `0` allowed/succeeded, `101` static policy block
 
 ## 📄 License
 Released under the [MIT License](LICENSE).
+
+Project governance and security documents: [Changelog](CHANGELOG.md) · [Threat model](THREAT_MODEL.md) · [Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
