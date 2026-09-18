@@ -45,7 +45,7 @@ The current implementation and operational experience are scoped to one shared *
 
 ## Project Status & Validation
 
-HPCGuard is maintainer-operated on one shared Slurm cluster and has been used there for more than one month. Community interest is shown separately through the live GitHub star and fork badges above; those numbers are not presented as verified installations or active users.
+HPCGuard is maintainer-operated on one shared Slurm cluster and has been used there for more than one month.
 
 The project currently has 73 regression assertions, with syntax checks, ShellCheck, and the regression suite running in GitHub Actions. Compatibility claims are intentionally limited to evidence that has actually been collected:
 
